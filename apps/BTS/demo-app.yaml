@@ -12,7 +12,7 @@ granttypes:
   - refresh_token
 
 callbacks:
-  - https://demo-dev.bts.example.com/callback
+  - https://new-callback/callback
 
 logouturls:
   - https://demo-dev.bts.example.com/logout
