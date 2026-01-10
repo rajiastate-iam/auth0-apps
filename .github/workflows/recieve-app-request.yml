@@ -1,3 +1,117 @@
+name: Receive Auth0 App Request (Create PR)
+
+on:
+  repository_dispatch:
+    types: [auth0_app_request]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout auth0-apps repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract payload
+        id: p
+        shell: pwsh
+        run: |
+          $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $cp = $event.client_payload
+
+          if (-not $cp) { throw "Missing client_payload in repository_dispatch event" }
+
+          "src_repo=$($cp.src_repo)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "src_sha=$($cp.src_sha)"   | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "src_file=$($cp.src_file)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "org=$($cp.org)"           | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "app=$($cp.app)"           | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "env=$($cp.env)"           | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Write-Host "Payload:"
+          Write-Host "  repo=$($cp.src_repo)"
+          Write-Host "  sha =$($cp.src_sha)"
+          Write-Host "  file=$($cp.src_file)"
+          Write-Host "  org =$($cp.org)"
+          Write-Host "  app =$($cp.app)"
+          Write-Host "  env =$($cp.env)"
+
+      - name: Enforce allowlist and safe path
+        shell: pwsh
+        run: |
+          $srcRepo = "${{ steps.p.outputs.src_repo }}"
+          $srcFile = "${{ steps.p.outputs.src_file }}"
+
+          if ($srcRepo -notmatch '^rajiastate\/') {
+            throw "src_repo not allowed: $srcRepo"
+          }
+
+          if ($srcFile -notmatch '^apps\/.*\.ya?ml$') {
+            throw "src_file must be apps/*.yml|yaml. Got: $srcFile"
+          }
+
+      - name: Download YAML from source repo at exact commit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "${{ steps.p.outputs.src_repo }}"
+          $sha  = "${{ steps.p.outputs.src_sha }}"
+          $file = "${{ steps.p.outputs.src_file }}"
+
+          $uri = "https://api.github.com/repos/$repo/contents/$file?ref=$sha"
+          Write-Host "Downloading: $uri"
+
+          $resp = Invoke-RestMethod `
+            -Uri $uri `
+            -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = "application/vnd.github+json"
+              "User-Agent"  = "github-actions"
+            }
+
+          if (-not $resp.content) { throw "GitHub API response missing content" }
+
+          $bytes   = [Convert]::FromBase64String($resp.content)
+          $content = [Text.Encoding]::UTF8.GetString($bytes)
+
+          New-Item -ItemType Directory -Force -Path "/tmp/appreq" | Out-Null
+          $content | Out-File "/tmp/appreq/app.yaml" -Encoding utf8
+
+          Write-Host "Downloaded YAML (first 20 lines):"
+          Get-Content "/tmp/appreq/app.yaml" -TotalCount 20
+
+      - name: Commit and push branch
+        id: commit
+        shell: pwsh
+        run: |
+          $org = "${{ steps.p.outputs.org }}"
+          $app = "${{ steps.p.outputs.app }}"
+          $env = "${{ steps.p.outputs.env }}"
+
+          $branch = "auto/$org-$app-$env-${{ github.run_id }}"
+          $target = "apps/$org/$app-$env.yaml"
+
+          git checkout -b $branch
+          New-Item -ItemType Directory -Force -Path "apps/$org" | Out-Null
+          Copy-Item "/tmp/appreq/app.yaml" $target -Force
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add $target
+          git commit -m "Auth0 app request: $org / $app / $env"
+          git push origin $branch
+
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Open PR
         shell: pwsh
         env:
@@ -21,11 +135,13 @@
             head  = "${{ steps.commit.outputs.branch }}"
             base  = "master"
             body  = $body
-          } | ConvertTo-Json -Depth 5
+          } | ConvertTo-Json -Depth 6
+
+          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls"
 
           Invoke-RestMethod `
             -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
+            -Uri $uri `
             -Headers @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"

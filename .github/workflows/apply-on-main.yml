@@ -37,13 +37,3 @@ jobs:
 
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve
-
-      # ---- POC ONLY ----
-      - name: Upload Terraform state artifact (POC only)
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-state
-          path: |
-            terraform.tfstate
-            .terraform.lock.hcl
-          if-no-files-found: ignore
