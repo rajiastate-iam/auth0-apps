@@ -1,0 +1,34 @@
+      - name: Open PR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $title = "Auth0 App Request: ${{ steps.p.outputs.org }} / ${{ steps.p.outputs.app }} / ${{ steps.p.outputs.env }}"
+
+          $bodyLines = @(
+            "Automated Auth0 app registration request.",
+            "",
+            "Source repo: ${{ steps.p.outputs.src_repo }}",
+            "Commit:      ${{ steps.p.outputs.src_sha }}",
+            "Source file: ${{ steps.p.outputs.src_file }}",
+            "",
+            "Target file: ${{ steps.commit.outputs.target }}"
+          )
+          $body = $bodyLines -join "`n"
+
+          $payload = @{
+            title = $title
+            head  = "${{ steps.commit.outputs.branch }}"
+            base  = "master"
+            body  = $body
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod `
+            -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
+            -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = "application/vnd.github+json"
+              "User-Agent"  = "github-actions"
+            } `
+            -Body $payload

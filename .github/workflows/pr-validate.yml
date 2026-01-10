@@ -1,10 +1,10 @@
--name: PR Validation (Auth0)
+name: PR Validation (Auth0)
 
 on:
   pull_request:
     paths:
-       - "apps/**/*.yaml"
-       - "apps/**/*.yml"
+      - "apps/**/*.yaml"
+      - "apps/**/*.yml"
 
 jobs:
   validate-and-plan:
@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install yq
         run: |
@@ -24,11 +26,20 @@ jobs:
           sudo apt-get install -y yq
 
       - name: Validate YAML files
+        shell: pwsh
         run: |
-          for f in $(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep '^apps/.*\.yaml$' || true); do
-            echo "Validating $f"
+          $baseRef = "${{ github.base_ref }}"
+          $files = git diff --name-only "origin/$baseRef...HEAD" | Where-Object { $_ -match '^apps/.*\.ya?ml$' }
+
+          if (-not $files) {
+            Write-Host "No apps YAML files changed."
+            exit 0
+          }
+
+          foreach ($f in $files) {
+            Write-Host "Validating $f"
             bash scripts/validate_app_yaml.sh "$f"
-          done
+          }
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3

@@ -7,6 +7,10 @@ on:
       - "apps/**/*.yaml"
       - "apps/**/*.yml"
 
+concurrency:
+  group: terraform-apply-master
+  cancel-in-progress: false
+
 jobs:
   apply:
     runs-on: ubuntu-latest
@@ -35,7 +39,6 @@ jobs:
         run: terraform apply -input=false -auto-approve
 
       # ---- POC ONLY ----
-      # Upload terraform state to pass to the second workflow
       - name: Upload Terraform state artifact (POC only)
         uses: actions/upload-artifact@v4
         with:
