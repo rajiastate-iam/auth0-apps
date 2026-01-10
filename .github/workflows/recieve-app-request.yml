@@ -59,7 +59,7 @@ jobs:
           if ($srcSha -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
           if ($srcFile -notmatch '^apps\/.*\.ya?ml$') { throw "src_file invalid: '$srcFile'" }
 
-      - name: Get GitHub App token (read source repo)
+      - name: Get GitHub App token (read source repo + create PR)
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
@@ -75,17 +75,12 @@ jobs:
           $sha  = "${{ steps.p.outputs.src_sha }}"
           $path = "${{ steps.p.outputs.src_file }}"
 
-          # Build URL safely (path must be the file path)
           $uri = "https://api.github.com/repos/{0}/contents/{1}?ref={2}" -f $repo, $path, $sha
 
           Write-Host "repo=$repo"
           Write-Host "sha =$sha"
           Write-Host "path=$path"
           Write-Host "Downloading: $uri"
-
-          # Guardrails: if URL looks wrong, fail immediately
-          if ($uri -match "/contents/=") { throw "BUG: URL contains /contents/= (wrong path). URL=$uri" }
-          if ($uri -match "/contents/[0-9a-f]{20,40}\?ref=") { throw "BUG: URL path looks like SHA, not file. URL=$uri" }
 
           $resp = Invoke-RestMethod `
             -Uri $uri `
@@ -102,9 +97,6 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path "/tmp/appreq" | Out-Null
           $content | Out-File "/tmp/appreq/app.yaml" -Encoding utf8
-
-          Write-Host "Downloaded YAML (first 20 lines):"
-          Get-Content "/tmp/appreq/app.yaml" -TotalCount 20
 
       - name: Commit and push branch
         id: commit
@@ -131,10 +123,10 @@ jobs:
           "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Open PR
+      - name: Open PR (use GitHub App token, NOT github.token)
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           $title = "Auth0 App Request: ${{ steps.p.outputs.org }} / ${{ steps.p.outputs.app }} / ${{ steps.p.outputs.env }}"
 
@@ -155,9 +147,12 @@ jobs:
             body  = $body
           } | ConvertTo-Json -Depth 6
 
+          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls"
+          Write-Host "Creating PR via: $uri"
+
           Invoke-RestMethod `
             -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
+            -Uri $uri `
             -Headers @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
