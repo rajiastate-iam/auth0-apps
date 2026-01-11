@@ -25,8 +25,6 @@ on:
         required: true
         type: string
 
-# For reusable workflows, keep this minimal.
-# We'll use the GitHub App token for actual writes.
 permissions:
   contents: read
 
@@ -115,24 +113,27 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ inputs.org }}
+          APP: ${{ inputs.app }}
+          ENV_NAME: ${{ inputs.env }}
+          SRC_REPO: ${{ inputs.src_repo }}
+          SRC_SHA: ${{ inputs.src_sha }}
+          YAML_PATH: ${{ inputs.yaml_path }}
+          TARGET_FILE: ${{ steps.prep.outputs.target }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          title="Auth0 App Request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
+          title="Auth0 App Request: ${ORG} / ${APP} / ${ENV_NAME}"
           head_branch="${{ steps.prep.outputs.branch }}"
           base_branch="master"
 
-          # Build PR body safely (no YAML here-strings)
-          body="Automated Auth0 app registration request.
+          body=$'Automated Auth0 app registration request.\n\n'
+          body+="Source repo: ${SRC_REPO}\n"
+          body+="Commit:      ${SRC_SHA}\n"
+          body+="Source file: ${YAML_PATH}\n\n"
+          body+="Target file: ${TARGET_FILE}\n"
 
-Source repo: ${{ inputs.src_repo }}
-Commit:      ${{ inputs.src_sha }}
-Source file: ${{ inputs.yaml_path }}
-
-Target file: ${{ steps.prep.outputs.target }}
-"
-
-          # Create JSON payload with jq to avoid quoting issues
           payload="$(jq -n \
             --arg title "$title" \
             --arg head "$head_branch" \
@@ -143,5 +144,5 @@ Target file: ${{ steps.prep.outputs.target }}
           curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            "https://api.github.com/repos/${REPO}/pulls" \
             -d "$payload"
