@@ -36,9 +36,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout auth0-apps
+      - name: Checkout auth0-apps (target repo)
         uses: actions/checkout@v4
         with:
+          repository: rajiastate-iam/auth0-apps
+          ref: master
           fetch-depth: 0
 
       - name: Validate inputs and decode YAML
@@ -51,7 +53,6 @@ jobs:
 
           if ($envName -notmatch '^(dev|test|prod)$') { throw "env must be dev/test/prod. Got: $envName" }
 
-          # Make safe for branch names
           $safeOrg = ($org -replace '[^A-Za-z0-9._-]', '-')
           $safeApp = ($app -replace '[^A-Za-z0-9._-]', '-')
 
@@ -67,20 +68,16 @@ jobs:
           $decoded = "/tmp/appreq/app.yaml"
           $content | Out-File -FilePath $decoded -Encoding utf8 -NoNewline
 
-          Write-Host "Decoded YAML -> $decoded"
-          Write-Host "First 25 lines:"
-          Get-Content $decoded -TotalCount 25
+          "branch=$branch"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "target=$target"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "decoded=$decoded"| Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "decoded=$decoded" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Commit and push branch
+      - name: Commit and push branch (in auth0-apps)
         id: commit
         shell: pwsh
         run: |
-          $branch = "${{ steps.prep.outputs.branch }}"
-          $target = "${{ steps.prep.outputs.target }}"
+          $branch  = "${{ steps.prep.outputs.branch }}"
+          $target  = "${{ steps.prep.outputs.target }}"
           $decoded = "${{ steps.prep.outputs.decoded }}"
 
           git config user.name "github-actions[bot]"
@@ -100,7 +97,7 @@ jobs:
           "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Open PR
+      - name: Open PR (in auth0-apps)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -126,12 +123,10 @@ jobs:
 
           Invoke-RestMethod `
             -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
+            -Uri "https://api.github.com/repos/rajiastate-iam/auth0-apps/pulls" `
             -Headers @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
               "User-Agent"  = "github-actions"
             } `
             -Body $payload
-
-          Write-Host "PR request sent."
