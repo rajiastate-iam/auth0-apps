@@ -15,16 +15,18 @@ on:
       yaml_path:
         required: true
         type: string
+      yaml_b64:
+        required: true
+        type: string
       src_repo:
         required: true
         type: string
       src_sha:
         required: true
         type: string
-      yaml_b64:
-        required: true
-        type: string
 
+# For reusable workflows, keep this minimal.
+# We'll use the GitHub App token for actual writes.
 permissions:
   contents: read
 
@@ -33,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get GitHub App token (auth0-apps write)
+      - name: Get GitHub App token (auth0-apps only)
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
@@ -46,104 +48,100 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Validate inputs + decode YAML
+      - name: Validate inputs (basic)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          org="${{ inputs.org }}"
+          app="${{ inputs.app }}"
+          env="${{ inputs.env }}"
+          ypath="${{ inputs.yaml_path }}"
+          repo="${{ inputs.src_repo }}"
+          sha="${{ inputs.src_sha }}"
+
+          [[ "$org" =~ ^[A-Za-z0-9._-]+$ ]] || (echo "bad org" && exit 1)
+          [[ "$app" =~ ^[A-Za-z0-9._-]+$ ]] || (echo "bad app" && exit 1)
+          [[ "$env" =~ ^[A-Za-z0-9._-]+$ ]] || (echo "bad env" && exit 1)
+          [[ "$ypath" =~ ^apps/.*\.ya?ml$ ]] || (echo "bad yaml_path" && exit 1)
+          [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || (echo "bad src_repo" && exit 1)
+          [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || (echo "bad src_sha" && exit 1)
+
+      - name: Decode YAML into temp file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/appreq
+          echo "${{ inputs.yaml_b64 }}" | base64 -d > /tmp/appreq/app.yaml
+          echo "Decoded first 20 lines:"
+          head -n 20 /tmp/appreq/app.yaml
+
+      - name: Prepare branch + target path
         id: prep
-        shell: pwsh
+        shell: bash
         run: |
-          $org     = "${{ inputs.org }}"
-          $app     = "${{ inputs.app }}"
-          $envName = "${{ inputs.env }}".ToLower()
-          $yamlPath = "${{ inputs.yaml_path }}"
-          $srcRepo = "${{ inputs.src_repo }}"
-          $srcSha  = "${{ inputs.src_sha }}"
-          $yamlB64 = "${{ inputs.yaml_b64 }}"
+          set -euo pipefail
 
-          if ($org -notmatch '^[a-zA-Z0-9_.-]+$') { throw "Invalid org: $org" }
-          if ($app -notmatch '^[a-zA-Z0-9_.-]+$') { throw "Invalid app: $app" }
-          if ($envName -notmatch '^[a-zA-Z0-9_.-]+$') { throw "Invalid env: $envName" }
+          org="${{ inputs.org }}"
+          app="${{ inputs.app }}"
+          env="$(echo "${{ inputs.env }}" | tr '[:upper:]' '[:lower:]')"
 
-          if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "Invalid yaml_path: $yamlPath" }
-          if ($srcRepo -notmatch '^[^\/]+\/[^\/]+$') { throw "Invalid src_repo: $srcRepo" }
-          if ($srcSha -notmatch '^[0-9a-f]{7,40}$') { throw "Invalid src_sha: $srcSha" }
+          branch="auto/${org}-${app}-${env}-${{ github.run_id }}"
+          target="apps/${org}/${app}-${env}.yaml"
 
-          $bytes = [Convert]::FromBase64String($yamlB64)
-          $yaml  = [Text.Encoding]::UTF8.GetString($bytes)
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
 
-          New-Item -ItemType Directory -Force -Path "/tmp/appreq" | Out-Null
-          $yaml | Out-File "/tmp/appreq/app.yaml" -Encoding utf8
-
-          $branch = "auto/$org-$app-$envName-${{ github.run_id }}"
-          $target = "apps/$org/$app-$envName.yaml"
-
-          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          Write-Host "branch=$branch"
-          Write-Host "target=$target"
-          Write-Host "decoded yaml first 10 lines:"
-          Get-Content "/tmp/appreq/app.yaml" -TotalCount 10
-
-      - name: Commit and push branch (in auth0-apps)
-        id: commit
-        shell: pwsh
+      - name: Commit and push branch (auth0-apps)
+        shell: bash
         run: |
-          $branch = "${{ steps.prep.outputs.branch }}"
-          $target = "${{ steps.prep.outputs.target }}"
+          set -euo pipefail
 
-          git checkout -b $branch
+          branch="${{ steps.prep.outputs.branch }}"
+          target="${{ steps.prep.outputs.target }}"
 
-          $dir = Split-Path $target -Parent
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item "/tmp/appreq/app.yaml" $target -Force
+          git checkout -b "$branch"
+          mkdir -p "$(dirname "$target")"
+          cp /tmp/appreq/app.yaml "$target"
 
-          git config user.name  "auth0-apps-bot"
-          git config user.email "auth0-apps-bot@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add $target
+          git add "$target"
+          git commit -m "Auth0 app request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
+          git push origin "$branch"
 
-          # allow idempotent runs
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "No changes to commit."
-          } else {
-            git commit -m "Auth0 app request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
-            git push origin $branch
-          }
-
-          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Open PR (in auth0-apps) using App token
-        shell: pwsh
+      - name: Open PR (auth0-apps) using App token
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          $title = "Auth0 App Request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
-          $body = @"
-Automated Auth0 app registration request.
+          set -euo pipefail
+
+          title="Auth0 App Request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
+          head_branch="${{ steps.prep.outputs.branch }}"
+          base_branch="master"
+
+          # Build PR body safely (no YAML here-strings)
+          body="Automated Auth0 app registration request.
 
 Source repo: ${{ inputs.src_repo }}
 Commit:      ${{ inputs.src_sha }}
 Source file: ${{ inputs.yaml_path }}
 
 Target file: ${{ steps.prep.outputs.target }}
-"@
+"
 
-          $payloadObj = @{
-            title = $title
-            head  = "${{ steps.prep.outputs.branch }}"
-            base  = "master"
-            body  = $body
-          }
+          # Create JSON payload with jq to avoid quoting issues
+          payload="$(jq -n \
+            --arg title "$title" \
+            --arg head "$head_branch" \
+            --arg base "$base_branch" \
+            --arg body "$body" \
+            '{title:$title, head:$head, base:$base, body:$body}')"
 
-          $payload = $payloadObj | ConvertTo-Json -Depth 10
-
-          Invoke-RestMethod `
-            -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
-            -Headers @{
-              Authorization = "Bearer $env:GH_TOKEN"
-              Accept        = "application/vnd.github+json"
-              "User-Agent"  = "github-actions"
-            } `
-            -Body $payload
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -d "$payload"
