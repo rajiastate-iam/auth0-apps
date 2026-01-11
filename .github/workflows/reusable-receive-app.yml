@@ -12,13 +12,18 @@ on:
       env:
         required: true
         type: string
-      yaml_path:
-        required: true
-        type: string
+
       src_repo:
         required: true
         type: string
       src_sha:
+        required: true
+        type: string
+      yaml_path:
+        required: true
+        type: string
+
+      yaml_b64:
         required: true
         type: string
 
@@ -36,105 +41,88 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout source repo at commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.src_repo }}
-          ref: ${{ inputs.src_sha }}
-          path: src
-          fetch-depth: 1
-
-      - name: Validate inputs
-        shell: pwsh
-        run: |
-          $org     = "${{ inputs.org }}"
-          $app     = "${{ inputs.app }}"
-          $envName = "${{ inputs.env }}"
-          $yamlRel = "${{ inputs.yaml_path }}"
-          $srcRepo = "${{ inputs.src_repo }}"
-          $srcSha  = "${{ inputs.src_sha }}"
-
-          if ($org -match '[\/\\]') { throw "Invalid org (no slashes): $org" }
-          if ($app -match '[\/\\]') { throw "Invalid app (no slashes): $app" }
-          if ($envName -notmatch '^(dev|test|prod)$') { throw "env must be dev/test/prod. Got: $envName" }
-          if ($yamlRel -notmatch '^apps\/.*\.ya?ml$') { throw "yaml_path must be under apps/*.yml|yaml. Got: $yamlRel" }
-          if ($srcRepo -notmatch '^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$') { throw "src_repo invalid: $srcRepo" }
-          if ($srcSha -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
-
-          $full = Join-Path "src" $yamlRel
-          if (-not (Test-Path $full)) { throw "YAML not found in source checkout: $full" }
-
-          Write-Host "Validated input and file exists: $full"
-
-      - name: Copy YAML into auth0-apps layout
+      - name: Validate inputs and decode YAML
         id: prep
         shell: pwsh
         run: |
           $org     = "${{ inputs.org }}"
           $app     = "${{ inputs.app }}"
-          $envName = "${{ inputs.env }}".ToLower()
-          $yamlRel = "${{ inputs.yaml_path }}"
+          $envName = ("${{ inputs.env }}").ToLower()
 
-          $srcFile = Join-Path "src" $yamlRel
-          $dstDir  = Join-Path "apps" $org
-          $dstFile = Join-Path $dstDir ("{0}-{1}.yaml" -f $app, $envName)
+          if ($envName -notmatch '^(dev|test|prod)$') { throw "env must be dev/test/prod. Got: $envName" }
 
-          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-          Copy-Item -Path $srcFile -Destination $dstFile -Force
+          # Make safe for branch names
+          $safeOrg = ($org -replace '[^A-Za-z0-9._-]', '-')
+          $safeApp = ($app -replace '[^A-Za-z0-9._-]', '-')
 
-          "target=$dstFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Copied: $srcFile -> $dstFile"
+          $branch = "auto/$safeOrg-$safeApp-$envName-${{ github.run_id }}"
+          $target = "apps/$org/$app-$envName.yaml"
+
+          New-Item -ItemType Directory -Force -Path "/tmp/appreq" | Out-Null
+
+          $b64 = "${{ inputs.yaml_b64 }}"
+          $bytes = [Convert]::FromBase64String($b64)
+          $content = [Text.Encoding]::UTF8.GetString($bytes)
+
+          $decoded = "/tmp/appreq/app.yaml"
+          $content | Out-File -FilePath $decoded -Encoding utf8 -NoNewline
+
+          Write-Host "Decoded YAML -> $decoded"
+          Write-Host "First 25 lines:"
+          Get-Content $decoded -TotalCount 25
+
+          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "decoded=$decoded" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Commit and push branch
         id: commit
         shell: pwsh
         run: |
-          $org     = "${{ inputs.org }}"
-          $app     = "${{ inputs.app }}"
-          $envName = "${{ inputs.env }}".ToLower()
-          $runId   = "${{ github.run_id }}"
-          $branch  = "auto/$org-$app-$envName-$runId"
+          $branch = "${{ steps.prep.outputs.branch }}"
+          $target = "${{ steps.prep.outputs.target }}"
+          $decoded = "${{ steps.prep.outputs.decoded }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git checkout -b $branch
-          git add "${{ steps.prep.outputs.target }}"
-          git commit -m "Auth0 app request: $org / $app / $envName"
+
+          $dir = Split-Path $target -Parent
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+          Copy-Item $decoded $target -Force
+
+          git add $target
+          git commit -m "Auth0 app request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
           git push origin $branch
 
           "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Pushed branch: $branch"
+          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Open PR
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $org     = "${{ inputs.org }}"
-          $app     = "${{ inputs.app }}"
-          $envName = "${{ inputs.env }}".ToLower()
+          $title = "Auth0 App Request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
 
-          $title = "Auth0 App Request: $org / $app / $envName"
-
-          $bodyLines = @(
+          $body = @(
             "Automated Auth0 app registration request.",
             "",
             "Source repo: ${{ inputs.src_repo }}",
             "Commit:      ${{ inputs.src_sha }}",
             "Source file: ${{ inputs.yaml_path }}",
             "",
-            "Target file: ${{ steps.prep.outputs.target }}"
-          )
-          $body = $bodyLines -join "`n"
+            "Target file: ${{ steps.commit.outputs.target }}"
+          ) -join "`n"
 
-          $payloadObj = @{
+          $payload = @{
             title = $title
             head  = "${{ steps.commit.outputs.branch }}"
             base  = "master"
             body  = $body
-          }
-          $payloadJson = $payloadObj | ConvertTo-Json -Depth 6
+          } | ConvertTo-Json -Depth 10
 
           Invoke-RestMethod `
             -Method POST `
@@ -144,6 +132,6 @@ jobs:
               Accept        = "application/vnd.github+json"
               "User-Agent"  = "github-actions"
             } `
-            -Body $payloadJson
+            -Body $payload
 
-          Write-Host "PR created successfully."
+          Write-Host "PR request sent."
