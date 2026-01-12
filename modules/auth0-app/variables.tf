@@ -29,11 +29,6 @@ variable "jwt_lifetime_in_seconds" {
   default = 3600
 }
 
-# Names of connections to enable for this client (from YAML)
-variable "connections" {
-  type    = set(string)
-  default = []
-}
 
 
 variable "connections" {
