@@ -3,13 +3,27 @@ name: Reusable - Receive Auth0 App
 on:
   workflow_call:
     inputs:
-      org: { required: true, type: string }
-      app: { required: true, type: string }
-      env: { required: true, type: string }
-      yaml_b64: { required: true, type: string }
-      yaml_path: { required: true, type: string }
-      src_repo: { required: true, type: string }
-      src_sha: { required: true, type: string }
+      org:
+        required: true
+        type: string
+      app:
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+      yaml_b64:
+        required: true
+        type: string
+      yaml_path:
+        required: true
+        type: string
+      src_repo:
+        required: true
+        type: string
+      src_sha:
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,35 +41,66 @@ jobs:
           app_id: ${{ secrets.AUTH0_GHAPP_ID }}
           private_key: ${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}
 
-      - uses: actions/checkout@v4
+      - name: Checkout auth0-apps repo
+        uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
 
-      - name: Decode YAML
+      - name: Decode YAML into target path
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          $org = "${{ inputs.org }}"
+          $app = "${{ inputs.app }}"
+          $envName = "${{ inputs.env }}".ToLower()
+
           $bytes = [Convert]::FromBase64String("${{ inputs.yaml_b64 }}")
-          New-Item -ItemType Directory -Force apps/${{ inputs.org }} | Out-Null
-          [IO.File]::WriteAllBytes(
-            "apps/${{ inputs.org }}/${{ inputs.app }}-${{ inputs.env }}.yaml",
-            $bytes
-          )
 
-      - name: Commit and push
+          $targetDir  = "apps/$org"
+          $targetFile = "$targetDir/$app-$envName.yaml"
+
+          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+          [IO.File]::WriteAllBytes($targetFile, $bytes)
+
+          Write-Host "Wrote $targetFile"
+
+      - name: Commit and push branch
+        id: commit
         shell: pwsh
         run: |
-          git checkout -b auto/${{ inputs.org }}-${{ inputs.app }}-${{ inputs.env }}
-          git add apps
-          git config user.name "iam-auth0-bot"
+          $ErrorActionPreference = "Stop"
+
+          $branch = "auto/${{ inputs.org }}-${{ inputs.app }}-${{ inputs.env }}-${{ github.run_id }}"
+
+          git checkout -b $branch
+
+          git config user.name  "iam-auth0-bot"
           git config user.email "iam-auth0-bot@users.noreply.github.com"
+
+          git add apps
           git commit -m "Auth0 app: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
-          git push origin HEAD
+          git push origin $branch
+
+          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Open PR
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh pr create \
-            --title "Auth0 App: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}" \
-            --body "Source: ${{ inputs.src_repo }}@${{ inputs.src_sha }}"
+          $ErrorActionPreference = "Stop"
+
+          $title = "Auth0 app: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
+          $body = @(
+            "Source repository: ${{ inputs.src_repo }}",
+            "Source commit:     ${{ inputs.src_sha }}",
+            "Source file:       ${{ inputs.yaml_path }}"
+          ) -join "`n"
+
+          gh pr create `
+            --title $title `
+            --body  $body `
+            --base  master `
+            --head  "${{ steps.commit.outputs.branch }}"
