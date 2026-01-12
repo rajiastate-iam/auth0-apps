@@ -31,7 +31,6 @@ jobs:
           Write-Host "src_sha:   $srcSha"
           Write-Host "yaml_path: $yamlPath"
 
-          # allowlist org + basic validation
           if ($srcRepo -notmatch '^rajiastate-iam\/[A-Za-z0-9_.-]+$') { throw "src_repo not allowed: $srcRepo" }
           if ($srcSha  -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
           if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "yaml_path invalid: $yamlPath" }
@@ -40,14 +39,14 @@ jobs:
           "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Mint GitHub App token (ORG secrets)
+      - name: Mint GitHub App token (ORG secrets) for auth0-apps installation
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
           app_id: ${{ secrets.AUTH0_GHAPP_ID }}
           private_key: ${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}
-          owner: rajiastate-iam
-          repositories: auth0-apps
+          installation_retrieval_mode: repository
+          installation_retrieval_payload: '{"repository":"rajiastate-iam/auth0-apps"}'
 
       - name: Checkout auth0-apps (with App token)
         uses: actions/checkout@v4
@@ -66,9 +65,6 @@ jobs:
           $sha  = "${{ steps.p.outputs.src_sha }}"
           $path = "${{ steps.p.outputs.yaml_path }}"
 
-          if ($path -notmatch '^apps\/.*\.ya?ml$') { throw "Bad yaml_path: $path" }
-
-          # Correct Contents API URL: /contents/{path}?ref={sha}
           $encodedPath = [System.Uri]::EscapeDataString($path).Replace("%2F","/")
           $uri = "https://api.github.com/repos/$repo/contents/$encodedPath?ref=$sha"
 
