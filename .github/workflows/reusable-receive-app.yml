@@ -7,12 +7,6 @@ on:
       src_sha:    { required: true, type: string }
       yaml_path:  { required: true, type: string }
 
-    secrets:
-      AUTH0_GHAPP_ID:
-        required: true
-      AUTH0_GHAPP_PRIVATE_KEY:
-        required: true
-
 permissions:
   contents: read
 
@@ -21,6 +15,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Ensure GitHub App secrets exist (safe)
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_ID }}")) { throw "Missing AUTH0_GHAPP_ID in auth0-apps secrets" }
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}")) { throw "Missing AUTH0_GHAPP_PRIVATE_KEY in auth0-apps secrets" }
+
       - name: Get GitHub App token
         id: app-token
         uses: tibdex/github-app-token@v2
@@ -65,7 +65,7 @@ jobs:
               "User-Agent"  = "github-actions"
             }
 
-          if (-not $resp.content) { throw "GitHub API response missing content for $path" }
+          if (-not $resp.content) { throw "Missing content for $path" }
 
           $bytes = [Convert]::FromBase64String($resp.content)
           New-Item -ItemType Directory -Force -Path "tmp/appreq" | Out-Null
@@ -88,7 +88,7 @@ jobs:
           $app = [string]$y.app
           $env = ([string]$y.env).ToLower()
 
-          if ($env -notin @('dev','test','prod')) { throw "env must be DEV|TEST|PROD" }
+          if ($env -notin @('dev','test','prod')) { throw "env must be dev|test|prod (got $env)" }
 
           $branch = "auto/$org-$app-$env-${{ github.run_id }}"
           $target = "apps/$org/$app-$env.yaml"
