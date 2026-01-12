@@ -20,7 +20,6 @@ concurrency:
 jobs:
   apply:
     runs-on: ubuntu-latest
-
     env:
       TF_VAR_auth0_domain:        ${{ secrets.AUTH0_DOMAIN }}
       TF_VAR_auth0_client_id:     ${{ secrets.AUTH0_CLIENT_ID }}
@@ -28,21 +27,60 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache Terraform State
-        uses: actions/cache@v4
         with:
-          path: terraform-state
-          key: terraform-state-${{ github.ref }}
-          restore-keys: terraform-state-
-
-      - name: Ensure Terraform State Directory
-        run: mkdir -p terraform-state
+          fetch-depth: 0
 
       - uses: hashicorp/setup-terraform@v3
+
+      - name: Detect changed app files in merge commit
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE="$(git rev-parse HEAD~1)"
+          fi
+          mapfile -t changed_yaml < <(git diff --name-only "$BEFORE" "$AFTER" | grep -E '^apps/.*\.ya?ml$' || true)
+          if [ ${#changed_yaml[@]} -eq 0 ]; then
+            echo "No app YAML changes detected; nothing to apply."
+            echo 'changed_json=[]' >> "$GITHUB_OUTPUT"
+          else
+            printf 'changed_json=[' >> "$GITHUB_OUTPUT"
+            first=1
+            for f in "${changed_yaml[@]}"; do
+              if [ $first -eq 1 ]; then first=0; else printf ',' >> "$GITHUB_OUTPUT"; fi
+              printf '"%s"' "$f" >> "$GITHUB_OUTPUT"
+            done
+            printf ']\n' >> "$GITHUB_OUTPUT"
+            printf "Changed files:\n%s\n" "${changed_yaml[@]}"
+          fi
+
+      - name: Build apps.auto.tfvars.json (from merge commit)
+        env:
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, sys, yaml
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          apps = []
+          for path in changed:
+            with open(path, "r", encoding="utf-8") as fh:
+              data = yaml.safe_load(fh)
+            for k in ["orgname","app","env","displayname","apptype"]:
+              if k not in data or data[k] is None:
+                print(f"Missing required key '{k}' in {path}", file=sys.stderr)
+                sys.exit(1)
+            apps.append(data)
+          with open("apps.auto.tfvars.json","w",encoding="utf-8") as out:
+            json.dump({"apps": apps}, out)
+          print("Wrote apps.auto.tfvars.json with", len(apps), "app(s).")
+          PY
 
       - name: Terraform Init
         run: terraform init -input=false
 
-      - name: Terraform Apply
-        run: terraform apply -input=false -auto-approve -state=terraform-state/terraform.tfstate
+      - name: Terraform Apply (only PR apps)
+        run: terraform apply -input=false -auto-approve

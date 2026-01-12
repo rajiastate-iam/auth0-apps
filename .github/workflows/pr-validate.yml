@@ -15,7 +15,6 @@ permissions:
 jobs:
   validate-and-plan:
     runs-on: ubuntu-latest
-
     env:
       TF_VAR_auth0_domain:        ${{ secrets.AUTH0_DOMAIN }}
       TF_VAR_auth0_client_id:     ${{ secrets.AUTH0_CLIENT_ID }}
@@ -26,17 +25,122 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cache Terraform State
-        uses: actions/cache@v4
-        with:
-          path: terraform-state
-          key: terraform-state-${{ github.ref }}
-          restore-keys: terraform-state-
+      - name: Detect changed app files in PR
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$BASE"
+          BEFORE="$(git merge-base HEAD origin/$BASE)"
+          AFTER="HEAD"
+          mapfile -t changed_yaml < <(git diff --name-only "$BEFORE" "$AFTER" | grep -E '^apps/.*\.ya?ml$' || true)
+          if [ ${#changed_yaml[@]} -eq 0 ]; then
+            echo "No app YAML changes detected."
+            echo 'changed_json=[]' >> "$GITHUB_OUTPUT"
+          else
+            printf 'changed_json=[' >> "$GITHUB_OUTPUT"
+            first=1
+            for f in "${changed_yaml[@]}"; do
+              if [ $first -eq 1 ]; then first=0; else printf ',' >> "$GITHUB_OUTPUT"; fi
+              printf '"%s"' "$f" >> "$GITHUB_OUTPUT"
+            done
+            printf ']\n' >> "$GITHUB_OUTPUT"
+            printf "Changed files:\n%s\n" "${changed_yaml[@]}"
+          fi
 
-      - name: Ensure Terraform State Directory
-        run: mkdir -p terraform-state
+      # ---------- POLICY VALIDATION (blocks merge) ----------
+      - name: Validate app policy (no localhost/http, SNOW req present, allowed connections)
+        env:
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, sys, yaml
+          from urllib.parse import urlparse
+
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          if not changed:
+            print("No app YAMLs changed; skipping validation.")
+            sys.exit(0)
+
+          ALLOWED_CONNS = {"CustomersDB","azure-ad-prod"}
+
+          def check_urls(urls, field):
+            problems = []
+            for u in urls:
+              p = urlparse(u)
+              if p.scheme != "https":
+                problems.append(f"{field}: URL must use https -> {u}")
+              host = (p.hostname or "").lower()
+              if host in {"localhost", "127.0.0.1"} or host.endswith(".local"):
+                problems.append(f"{field}: localhost/127.0.0.1/.local not allowed -> {u}")
+            return problems
+
+          errors = []
+          for path in changed:
+            with open(path, "r", encoding="utf-8") as fh:
+              data = yaml.safe_load(fh) or {}
+
+            # Required keys
+            for k in ["orgname","app","env","displayname","apptype","servicenow_req"]:
+              if not data.get(k):
+                errors.append(f"{path}: missing required key '{k}'")
+
+            # SNOW req format
+            snow = str(data.get("servicenow_req",""))
+            if snow and not snow.startswith("REQ") or not snow[3:].isdigit():
+              errors.append(f"{path}: servicenow_req must match REQ<digits> (e.g., REQ0012345)")
+
+            # URL checks
+            callbacks      = data.get("callbacks",[]) or []
+            logouturls     = data.get("logouturls",[]) or []
+            allowedorigins = data.get("allowedorigins",[]) or []
+
+            for field, urls in [("callbacks", callbacks),
+                                ("logouturls", logouturls),
+                                ("allowedorigins", allowedorigins)]:
+              errors += check_urls(urls, field)
+
+            # Connections policy (only allowed names and no extras)
+            conns = set(data.get("connections",[]) or [])
+            unknown = conns - ALLOWED_CONNS
+            if unknown:
+              errors.append(f"{path}: unsupported connections {sorted(unknown)}. Allowed: {sorted(ALLOWED_CONNS)}")
+
+            # At least one connection required
+            if not conns:
+              errors.append(f"{path}: 'connections' must include at least one of {sorted(ALLOWED_CONNS)}")
+
+          if errors:
+            print("VALIDATION FAILED:")
+            for e in errors:
+              print(f" - {e}")
+            sys.exit(1)
+          else:
+            print("Validation passed ✅")
+          PY
 
       - uses: hashicorp/setup-terraform@v3
+
+      # Build tfvars from the (already validated) PR files
+      - name: Build apps.auto.tfvars.json (from PR files)
+        env:
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, sys, yaml
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          apps = []
+          for path in changed:
+            with open(path, "r", encoding="utf-8") as fh:
+              data = yaml.safe_load(fh)
+            apps.append(data)
+          with open("apps.auto.tfvars.json","w",encoding="utf-8") as out:
+            json.dump({"apps": apps}, out)
+          print("Wrote apps.auto.tfvars.json with", len(apps), "app(s).")
+          PY
 
       - name: Terraform Init
         run: terraform init -input=false
@@ -44,6 +148,8 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
-      - name: Terraform Plan
-        run: terraform plan -input=false -no-color -state=terraform-state/terraform.tfstate
+      - name: Terraform Plan (only PR apps)
+        run: terraform plan -input=false -no-color -out=tfplan
 
+      - name: Show Plan
+        run: terraform show -no-color tfplan

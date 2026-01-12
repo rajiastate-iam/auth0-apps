@@ -29,5 +29,18 @@ variable "jwt_lifetime_in_seconds" {
   default = 3600
 }
 
+# Names of connections to enable for this client (from YAML)
+variable "connections" {
+  type    = set(string)
+  default = []
+}
+
+# Managed connection names (the set we control strictly via Terraform)
+# You can keep this as exactly the two you mentioned, or widen later.
+variable "managed_connection_names" {
+  type    = set(string)
+  default = ["CustomersDB", "azure-ad-prod"]
+}
+
 variable "org_name" {}
 variable "servicenow_req" {}
