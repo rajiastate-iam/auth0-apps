@@ -34,237 +34,217 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: hashicorp/setup-terraform@v3
-
-      # Detect changed YAMLs in the merge commit
       - name: Detect changed app files
         id: pick
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.sha }}"
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            BEFORE="$(git rev-parse HEAD~1)"
-          fi
-          mapfile -t changed_yaml < <(git diff --name-only "$BEFORE" "$AFTER" | grep -E '^apps/.*\.ya?ml$' || true)
-          if [ ${#changed_yaml[@]} -eq 0 ]; then
-            echo "No app YAML changes detected; nothing to apply."
-            echo 'changed_json=[]' >> "$GITHUB_OUTPUT"
-          else
-            printf 'changed_json=[' >> "$GITHUB_OUTPUT"
-            first=1
-            for f in "${changed_yaml[@]}"; do
-              if [ $first -eq 1 ]; then first=0; else printf ',' >> "$GITHUB_OUTPUT"; fi
-              printf '"%s"' "$f" >> "$GITHUB_OUTPUT"
-            done
-            printf ']\n' >> "$GITHUB_OUTPUT"
-            printf "Changed files:\n%s\n" "${changed_yaml[@]}"
-          fi
+          $ErrorActionPreference = "Stop"
+          $before = "${{ github.event.before }}"
+          $after  = "${{ github.sha }}"
+          if ([string]::IsNullOrWhiteSpace($before) -or $before -eq "0000000000000000000000000000000000000000") {
+            $before = $(git rev-parse HEAD~1)
+          }
+          $changed = @(git diff --name-only $before $after |
+            Where-Object { $_ -match '^apps\/.*\.ya?ml$' } |
+            ForEach-Object { $_.Trim() } |
+            Sort-Object -Unique)
 
-      # Build tfvars from the changed YAMLs (apps)
-      - name: Build apps.auto.tfvars.json
+          if ($changed.Count -eq 0) {
+            Write-Host "No app YAML changes detected; nothing to apply."
+            "changed_json=[]" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            $json = "[" + (($changed | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' }) -join ",") + "]"
+            "changed_json=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Changed files:"; $changed | ForEach-Object { Write-Host " - $_" }
+          }
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Build apps.auto.tfvars.json (PowerShell)
+        shell: pwsh
         env:
           CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
         run: |
-          set -euo pipefail
-          python3 - << 'PY'
-          import json, os, yaml
-          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
-          apps=[]
-          for path in changed:
-            apps.append(yaml.safe_load(open(path)))
-          open("apps.auto.tfvars.json","w").write(json.dumps({"apps":apps}))
-          print("Wrote apps.auto.tfvars.json with", len(apps), "app(s).")
-          PY
+          $ErrorActionPreference = "Stop"
+          Install-Module powershell-yaml -Scope CurrentUser -Force
+          Import-Module powershell-yaml
 
-      # Fetch ALL connections from Auth0 Management API (names & IDs)
-      - name: Fetch Auth0 connections (names + IDs)
-        id: conn
-        shell: bash
-        env:
-          DOMAIN: ${{ env.AUTH0_DOMAIN }}
-          CID:    ${{ env.AUTH0_CLIENT_ID }}
-          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          # Get M2M token
-          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
-            -H "content-type: application/json" \
-            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
-
-          # Fetch up to 1000 connections (adjust if needed)
-          ALL=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/connections" \
-            -H "authorization: Bearer ${TOK}" \
-            --data-urlencode "per_page=1000" \
-            --data-urlencode "page=0")
-
-          echo "$ALL" | jq -r '.[].name' > all_conn_names.txt
-          echo "$ALL" | jq -r '.[] | [.name, .id] | @tsv' > name_id.tsv
-
-          echo "Managed connection count: $(wc -l < all_conn_names.txt)"
-
-          # Build tfvars for managed_connection_names
-          jq -n --argjson names "$(jq -R -s -c 'split("\n")|map(select(length>0))' all_conn_names.txt)" \
-            '{managed_connection_names: ($names | unique)}' > connections.auto.tfvars.json
-
-          echo "managed_conn_json=$(cat connections.auto.tfvars.json)" >> "$GITHUB_OUTPUT"
+          $files = ConvertFrom-Json $env:CHANGED_JSON
+          $apps = @()
+          foreach ($path in $files) {
+            $apps += (Get-Content $path -Raw | ConvertFrom-Yaml)
+          }
+          $tfvars = @{ apps = $apps }
+          $json = $tfvars | ConvertTo-Json -Depth 20
+          Set-Content -Path "apps.auto.tfvars.json" -Value $json -Encoding UTF8
+          Write-Host "Wrote apps.auto.tfvars.json with $($apps.Count) app(s)."
 
       - name: Terraform Init
         run: terraform init -input=false
 
-      # ---------- AUTO-IMPORT to bypass provider guard ----------
-      # Import auth0_connection_clients for each managed connection
-      - name: Auto-import auth0_connection_clients
-        shell: bash
+      # -------- PRE-IMPORT: make guarded resources updatable (fail BEFORE create) --------
+      - name: Preflight import auth0_connection_clients
+        id: preflight
+        shell: pwsh
         env:
-          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"  # keep in sync with Terraform main.tf
         run: |
-          set -euo pipefail
-          # Derive the module instance key from the first app in this push
-          # (Assumption: one app per commit; if multiple, we loop imports for each)
-          python3 - << 'PY'
-          import json, yaml, os, sys
-          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
-          if not changed:
-            print("No apps in this push; skip import.")
-            sys.exit(0)
-          apps = [yaml.safe_load(open(p)) for p in changed]
-          # We'll import for the first app (repeatable per app if needed):
-          a = apps[0]
-          mod_key = f'{a["orgname"]}/{a["app"]}-{str(a["env"]).lower()}'
-          open("modkey.txt","w").write(mod_key)
-          print("Module key:", mod_key)
-          PY
+          $ErrorActionPreference = "Stop"
 
-          MODKEY=$(cat modkey.txt)
-          while IFS=$'\t' read -r NAME ID; do
-            # Address: module.auth0_app["<org>/<app>-<env>"].auth0_connection_clients.managed["<name>"]
-            ADDR="module.auth0_app[\"${MODKEY}\"].auth0_connection_clients.managed[\"${NAME}\"]"
-            echo "Importing ${ADDR} with connection ID ${ID}"
-            # Ignore failures (first run, resource may not exist yet) but continue
-            terraform import -no-color "${ADDR}" "${ID}" || true
-          done < name_id.tsv
+          # Get the changed YAMLs
+          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          if (-not $files -or $files.Count -eq 0) {
+            Write-Host "No apps to process in this push; skipping import."
+            exit 0
+          }
 
-      # ---------- PLAN ----------
+          # Management token
+          $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
+          $body = @{
+            client_id     = $env:AUTH0_CLIENT_ID
+            client_secret = $env:AUTH0_CLIENT_SECRET
+            audience      = $aud
+            grant_type    = "client_credentials"
+          } | ConvertTo-Json
+          $tokResp = Invoke-RestMethod -Method Post -Uri "https://$($env:AUTH0_DOMAIN)/oauth/token" `
+            -ContentType "application/json" -Body $body
+          $token = $tokResp.access_token
+          if (-not $token) { throw "Failed to get Auth0 Management API token." }
+
+          # Fetch ALL connections; filter by name in PS
+          $conns = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
+            -Headers @{ Authorization = "Bearer $token" }
+
+          # Managed connection names
+          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
+
+          # For each changed app, import connection_clients for each managed connection
+          Install-Module powershell-yaml -Scope CurrentUser -Force
+          Import-Module powershell-yaml
+
+          foreach ($path in $files) {
+            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
+            $org = [string]$obj.orgname
+            $app = [string]$obj.app
+            $env = ([string]$obj.env).ToLower()
+            $modKey = "$org/$app-$env"
+
+            foreach ($name in $managed) {
+              $conn = $conns | Where-Object { $_.name -eq $name }
+              if (-not $conn) { throw "Managed connection '$name' not found in tenant." }
+              $connId = $conn.id
+              $addr = "module.auth0_app[`"$modKey`"].auth0_connection_clients.managed[`"$name`"]"
+              Write-Host "Importing $addr with connection ID $connId"
+              terraform import "$addr" "$connId"
+            }
+          }
+
       - name: Terraform Plan (strict connections)
         id: tfplan
-        run: |
-          set -euo pipefail
-          terraform plan -input=false -no-color -out=tfplan
+        run: terraform plan -input=false -no-color -out=tfplan
 
-      # ---------- APPLY only if PLAN succeeded ----------
+      - name: Show Plan
+        run: terraform show -no-color tfplan
+
       - name: Terraform Apply
-        if: ${{ steps.tfplan.outcome == 'success' }}
         run: terraform apply -input=false -auto-approve tfplan
 
       # ---------- POST-APPLY ASSERTION ----------
-      # Verify that only the requested connections have this client enabled
-      - name: Assert connections enabled exactly as requested
-        if: ${{ success() }}
-        shell: bash
+      - name: Assert connections enabled only as requested
+        shell: pwsh
         env:
-          DOMAIN: ${{ env.AUTH0_DOMAIN }}
-          CID:    ${{ env.AUTH0_CLIENT_ID }}
-          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
-          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"
         run: |
-          set -euo pipefail
-          # Resolve client_id by displayname from YAML
-          python3 - << 'PY'
-          import json, yaml, os, sys
-          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
-          a = yaml.safe_load(open(changed[0]))
-          open("displayname.txt","w").write(a["displayname"])
-          # Also emit desired set
-          open("wanted.txt","w").write("\n".join(a.get("connections",[])))
-          PY
-          DISPLAYNAME=$(cat displayname.txt)
+          $ErrorActionPreference = "Stop"
 
-          # Get token
-          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
-            -H "content-type: application/json" \
-            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+          # Token
+          $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
+          $body = @{
+            client_id     = $env:AUTH0_CLIENT_ID
+            client_secret = $env:AUTH0_CLIENT_SECRET
+            audience      = $aud
+            grant_type    = "client_credentials"
+          } | ConvertTo-Json
+          $tokResp = Invoke-RestMethod -Method Post -Uri "https://$($env:AUTH0_DOMAIN)/oauth/token" `
+            -ContentType "application/json" -Body $body
+          $token = $tokResp.access_token
+          if (-not $token) { throw "Failed to get Auth0 Management API token." }
 
-          # Resolve client_id by name and list connections' enabled_clients
-          CLIENT_ID=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/clients" \
-            -H "authorization: Bearer ${TOK}" \
-            --data-urlencode "fields=name,client_id" \
-            --data-urlencode "include_fields=true" \
-            | jq -r --arg NAME "${DISPLAYNAME}" '.[] | select(.name==$NAME) | .client_id')
+          # Read back YAMLs and desired connections
+          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
 
-          [ -n "$CLIENT_ID" ] || { echo "Could not resolve client_id for ${DISPLAYNAME}"; exit 1; }
+          foreach ($path in $files) {
+            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
+            $display = [string]$obj.displayname
+            $want    = @($obj.connections) | Sort-Object -Unique
 
-          # Check each connection
-          WANT_SET=$(cat wanted.txt | sort | uniq | tr '\n' ' ')
-          BAD=0
-          while IFS=$'\t' read -r NAME ID; do
-            EN=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/connections/${ID}" \
-                  -H "authorization: Bearer ${TOK}" \
-                  --data-urlencode "fields=enabled_clients,name" \
-                  --data-urlencode "include_fields=true" \
-                | jq -r '.enabled_clients[]?') || true
-            HAS=$(echo "$EN" | grep -Fx "$CLIENT_ID" >/dev/null && echo "yes" || echo "no")
+            # Resolve client_id by name
+            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
+              -Headers @{ Authorization = "Bearer $token" }
+            $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
+            if (-not $clientId) { throw "Client '$display' not found after apply." }
 
-            IN_WANT=$(grep -Fx "$NAME" wanted.txt >/dev/null && echo "yes" || echo "no")
+            # Check each managed connection for presence of clientId
+            $bad = $false
+            foreach ($name in $managed) {
+              $conn = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000" `
+                -Headers @{ Authorization = "Bearer $token" }
+              $p = ($conn | Where-Object { $_.name -eq $name })
+              if (-not $p) { throw "Connection '$name' not found during assertion." }
 
-            if [ "$IN_WANT" = "yes" ] && [ "$HAS" = "no" ]; then
-              echo "❌ Expected ENABLED on ${NAME}, but client not present."
-              BAD=1
-            fi
-            if [ "$IN_WANT" = "no" ] && [ "$HAS" = "yes" ]; then
-              echo "❌ Expected DISABLED on ${NAME}, but client present."
-              BAD=1
-            fi
-          done < name_id.tsv
+              $enabled = $p.enabled_clients
+              $has = ($enabled -contains $clientId)
+              $shouldHave = ($want -contains $name)
 
-          if [ "$BAD" -eq 1 ]; then
-            echo "Post-apply assertion failed."
-            exit 1
-          fi
-          echo "Post-apply assertion passed ✅"
-      
+              if ($shouldHave -and (-not $has)) {
+                Write-Host "❌ Expected ENABLED on '$name' but not found."
+                $bad = $true
+              }
+              if ((-not $shouldHave) -and $has) {
+                Write-Host "❌ Expected DISABLED on '$name' but client is enabled."
+                $bad = $true
+              }
+            }
+
+            if ($bad) { throw "Post-apply assertion failed for '$display'." }
+            Write-Host "Post-apply assertion passed for '$display' ✅"
+          }
+
       # ---------- FAILURE CLEANUP ----------
-      # If something fails anywhere, delete the client to avoid stray apps
       - name: Cleanup client on failure (soft rollback)
         if: ${{ failure() }}
-        shell: bash
-        env:
-          DOMAIN: ${{ env.AUTH0_DOMAIN }}
-          CID:    ${{ env.AUTH0_CLIENT_ID }}
-          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
-          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        shell: pwsh
         run: |
-          set -euo pipefail
-          python3 - << 'PY'
-          import json, yaml, os
-          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
-          if not changed:
-            open("displayname.txt","w").write("")
-          else:
-            a = yaml.safe_load(open(changed[0]))
-            open("displayname.txt","w").write(a["displayname"])
-          PY
-          DISPLAYNAME=$(cat displayname.txt)
-          [ -n "$DISPLAYNAME" ] || { echo "No display name; nothing to cleanup."; exit 0; }
+          $ErrorActionPreference = "Stop"
 
-          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
-            -H "content-type: application/json" \
-            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+          $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
+          $body = @{
+            client_id     = $env:AUTH0_CLIENT_ID
+            client_secret = $env:AUTH0_CLIENT_SECRET
+            audience      = $aud
+            grant_type    = "client_credentials"
+          } | ConvertTo-Json
+          $tokResp = Invoke-RestMethod -Method Post -Uri "https://$($env:AUTH0_DOMAIN)/oauth/token" `
+            -ContentType "application/json" -Body $body
+          $token = $tokResp.access_token
+          if (-not $token) { Write-Host "No token; skipping cleanup."; exit 0 }
 
-          CLIENT_ID=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/clients" \
-            -H "authorization: Bearer ${TOK}" \
-            --data-urlencode "fields=name,client_id" \
-            --data-urlencode "include_fields=true" \
-            | jq -r --arg NAME "${DISPLAYNAME}" '.[] | select(.name==$NAME) | .client_id')
+          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          if (-not $files -or $files.Count -eq 0) { Write-Host "No files; skip cleanup."; exit 0 }
 
-          if [ -n "$CLIENT_ID" ]; then
-            echo "Deleting client ${DISPLAYNAME} (${CLIENT_ID}) due to failure."
-            curl -sS --fail -X DELETE "https://${DOMAIN}/api/v2/clients/${CLIENT_ID}" \
-              -H "authorization: Bearer ${TOK}" || true
-          else
-            echo "Client not found for cleanup."
-          fi
+          Install-Module powershell-yaml -Scope CurrentUser -Force
+          Import-Module powershell-yaml
+
+          foreach ($path in $files) {
+            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
+            $display = [string]$obj.displayname
+            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
+              -Headers @{ Authorization = "Bearer $token" }
+            $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
+            if ($clientId) {
+              Write-Host "Deleting client '$display' ($clientId) due to failure."
+              Invoke-RestMethod -Method Delete -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients/$clientId" `
+                -Headers @{ Authorization = "Bearer $token" } -ErrorAction SilentlyContinue
+            }
+          }
