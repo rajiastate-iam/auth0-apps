@@ -1,3 +1,4 @@
+
 name: PR Validation (Auth0)
 
 on:
@@ -25,6 +26,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache Terraform State
+        uses: actions/cache@v4
+        with:
+          path: terraform-state
+          key: terraform-state-${{ github.ref }}
+          restore-keys: terraform-state-
+
+      - name: Ensure Terraform State Directory
+        run: mkdir -p terraform-state
+
       - uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
@@ -34,4 +45,5 @@ jobs:
         run: terraform validate
 
       - name: Terraform Plan
-        run: terraform plan -input=false -no-color
+        run: terraform plan -input=false -no-color -state=terraform-state/terraform.tfstate
+
