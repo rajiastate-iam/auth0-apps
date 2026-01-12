@@ -13,73 +13,50 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout auth0-apps repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Extract payload (strict)
         id: p
         shell: pwsh
         run: |
           $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
           if (-not $event.client_payload) { throw "Missing client_payload" }
+
           $cp = $event.client_payload
 
           $srcRepo = [string]$cp.src_repo
           $srcSha  = [string]$cp.src_sha
-          $srcFile = [string]$cp.src_file
-          $org     = [string]$cp.org
-          $app     = [string]$cp.app
-          $envName = [string]$cp.env
+          $yamlPath = [string]$cp.yaml_path
 
-          Write-Host "repo=$srcRepo"
-          Write-Host "sha =$srcSha"
-          Write-Host "file=$srcFile"
+          if ($srcRepo -notmatch '^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$') { throw "bad src_repo: $srcRepo" }
+          if ($srcSha  -notmatch '^[0-9a-f]{7,40}$') { throw "bad src_sha: $srcSha" }
+          if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "bad yaml_path: $yamlPath" }
 
-          foreach ($pair in @(
-            "src_repo=$srcRepo",
-            "src_sha=$srcSha",
-            "src_file=$srcFile",
-            "org=$org",
-            "app=$app",
-            "env=$envName"
-          )) {
-            $pair | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
+          "src_repo=$srcRepo"   | Out-File $env:GITHUB_OUTPUT -Append
+          "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append
+          "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Validate payload (safe)
-        shell: pwsh
-        run: |
-          $srcRepo = "${{ steps.p.outputs.src_repo }}"
-          $srcSha  = "${{ steps.p.outputs.src_sha }}"
-          $srcFile = "${{ steps.p.outputs.src_file }}"
-
-          if ($srcRepo -notmatch '^rajiastate\/') { throw "src_repo not allowed: $srcRepo" }
-          if ($srcSha -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
-          if ($srcFile -notmatch '^apps\/.*\.ya?ml$') { throw "src_file invalid: '$srcFile'" }
-
-      - name: Get GitHub App token (read source repo + create PR)
+      - name: Get GitHub App token
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
           app_id: ${{ secrets.AUTH0_GHAPP_ID }}
           private_key: ${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}
 
-      - name: Download YAML from source repo at exact commit (correct URL)
+      - name: Checkout auth0-apps (with App token)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Download YAML from source repo at exact commit
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           $repo = "${{ steps.p.outputs.src_repo }}"
           $sha  = "${{ steps.p.outputs.src_sha }}"
-          $path = "${{ steps.p.outputs.src_file }}"
+          $path = "${{ steps.p.outputs.yaml_path }}"
 
-          $uri = "https://api.github.com/repos/{0}/contents/{1}?ref={2}" -f $repo, $path, $sha
-
-          Write-Host "repo=$repo"
-          Write-Host "sha =$sha"
-          Write-Host "path=$path"
+          $uri = "https://api.github.com/repos/$repo/contents/$path?ref=$sha"
           Write-Host "Downloading: $uri"
 
           $resp = Invoke-RestMethod `
@@ -90,69 +67,92 @@ jobs:
               "User-Agent"  = "github-actions"
             }
 
-          if (-not $resp.content) { throw "GitHub API response missing content" }
+          if (-not $resp.content) { throw "Missing content for $path" }
 
-          $bytes   = [Convert]::FromBase64String($resp.content)
-          $content = [Text.Encoding]::UTF8.GetString($bytes)
+          $bytes = [Convert]::FromBase64String($resp.content)
+          New-Item -ItemType Directory -Force -Path "tmp/appreq" | Out-Null
+          [IO.File]::WriteAllBytes("tmp/appreq/app.yaml", $bytes)
 
-          New-Item -ItemType Directory -Force -Path "/tmp/appreq" | Out-Null
-          $content | Out-File "/tmp/appreq/app.yaml" -Encoding utf8
+      - name: Parse YAML and compute target
+        id: meta
+        shell: pwsh
+        run: |
+          Install-Module powershell-yaml -Scope CurrentUser -Force
+          Import-Module powershell-yaml
+
+          $y = Get-Content "tmp/appreq/app.yaml" -Raw | ConvertFrom-Yaml
+
+          foreach ($k in @('orgname','app','env')) {
+            if (-not $y.$k) { throw "Missing required key '$k' in YAML" }
+          }
+
+          $org = [string]$y.orgname
+          $app = [string]$y.app
+          $env = ([string]$y.env).ToLower()
+
+          if ($env -notin @('dev','test','prod')) { throw "env must be dev|test|prod (got $env)" }
+
+          $branch = "auto/$org-$app-$env-${{ github.run_id }}"
+          $target = "apps/$org/$app-$env.yaml"
+
+          "org=$org"       | Out-File $env:GITHUB_OUTPUT -Append
+          "app=$app"       | Out-File $env:GITHUB_OUTPUT -Append
+          "env=$env"       | Out-File $env:GITHUB_OUTPUT -Append
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append
 
       - name: Commit and push branch
         id: commit
         shell: pwsh
         run: |
-          $org = "${{ steps.p.outputs.org }}"
-          $app = "${{ steps.p.outputs.app }}"
-          $envName = "${{ steps.p.outputs.env }}"
-
-          $branch = "auto/$org-$app-$envName-${{ github.run_id }}"
-          $target = "apps/$org/$app-$envName.yaml"
+          $branch = "${{ steps.meta.outputs.branch }}"
+          $target = "${{ steps.meta.outputs.target }}"
 
           git checkout -b $branch
-          New-Item -ItemType Directory -Force -Path "apps/$org" | Out-Null
-          Copy-Item "/tmp/appreq/app.yaml" $target -Force
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          $dir = Split-Path -Parent $target
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "tmp/appreq/app.yaml" $target -Force
+
+          git config user.name "auth0-automation"
+          git config user.email "auth0-automation@users.noreply.github.com"
 
           git add $target
-          git commit -m "Auth0 app request: $org / $app / $envName"
+          git commit -m "Auth0 app request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
           git push origin $branch
 
-          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Open PR (use GitHub App token, NOT github.token)
+      - name: Open PR
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          $title = "Auth0 App Request: ${{ steps.p.outputs.org }} / ${{ steps.p.outputs.app }} / ${{ steps.p.outputs.env }}"
+          $title = "Auth0 App Request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
+          $head  = "${{ steps.commit.outputs.branch }}"
+          $base  = "master"
 
           $body = @(
             "Automated Auth0 app registration request.",
             "",
             "Source repo: ${{ steps.p.outputs.src_repo }}",
             "Commit:      ${{ steps.p.outputs.src_sha }}",
-            "Source file: ${{ steps.p.outputs.src_file }}",
+            "Source file: ${{ steps.p.outputs.yaml_path }}",
             "",
             "Target file: ${{ steps.commit.outputs.target }}"
           ) -join "`n"
 
           $payload = @{
             title = $title
-            head  = "${{ steps.commit.outputs.branch }}"
-            base  = "master"
+            head  = $head
+            base  = $base
             body  = $body
           } | ConvertTo-Json -Depth 6
 
-          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls"
-          Write-Host "Creating PR via: $uri"
-
           Invoke-RestMethod `
             -Method POST `
-            -Uri $uri `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
             -Headers @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
