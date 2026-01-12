@@ -3,15 +3,10 @@ name: Reusable - Receive Auth0 App (Create PR)
 on:
   workflow_call:
     inputs:
-      org:        { required: true, type: string }
-      app:        { required: true, type: string }
-      env:        { required: true, type: string }
-      yaml_path:  { required: true, type: string }
-      yaml_b64:   { required: true, type: string }
       src_repo:   { required: true, type: string }
       src_sha:    { required: true, type: string }
+      yaml_path:  { required: true, type: string }
 
-    # ✅ REQUIRED: declare secrets used by reusable workflow
     secrets:
       AUTH0_GHAPP_ID:
         required: true
@@ -26,18 +21,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Sanity check secrets are available (safe)
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_ID }}")) {
-            throw "AUTH0_GHAPP_ID is not available to this reusable workflow run."
-          }
-          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}")) {
-            throw "AUTH0_GHAPP_PRIVATE_KEY is not available to this reusable workflow run."
-          }
-          Write-Host "Secrets are present."
-
-      - name: Get GitHub App token (auth0-apps only)
+      - name: Get GitHub App token
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
@@ -50,39 +34,48 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Validate inputs (strict)
+      - name: Validate inputs
         shell: pwsh
         run: |
-          $org  = "${{ inputs.org }}"
-          $app  = "${{ inputs.app }}"
-          $env  = "${{ inputs.env }}"
-          $yp   = "${{ inputs.yaml_path }}"
           $repo = "${{ inputs.src_repo }}"
           $sha  = "${{ inputs.src_sha }}"
+          $path = "${{ inputs.yaml_path }}"
 
-          if ($org  -notmatch '^[A-Za-z0-9._-]+$') { throw "bad org: $org" }
-          if ($app  -notmatch '^[A-Za-z0-9._-]+$') { throw "bad app: $app" }
-          if ($env  -notmatch '^(DEV|TEST|PROD)$')  { throw "bad env: $env" }
-          if ($yp   -notmatch '^apps\/.*\.ya?ml$')  { throw "bad yaml_path: $yp" }
           if ($repo -notmatch '^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$') { throw "bad src_repo: $repo" }
-          if ($sha  -notmatch '^[0-9a-f]{7,40}$')   { throw "bad src_sha: $sha" }
+          if ($sha  -notmatch '^[0-9a-f]{7,40}$') { throw "bad src_sha: $sha" }
+          if ($path -notmatch '^apps\/.*\.ya?ml$') { throw "bad yaml_path: $path" }
 
-      - name: Decode YAML to temp file
+      - name: Download YAML from source repo at exact commit
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          $bytes = [Convert]::FromBase64String("${{ inputs.yaml_b64 }}")
+          $repo = "${{ inputs.src_repo }}"
+          $sha  = "${{ inputs.src_sha }}"
+          $path = "${{ inputs.yaml_path }}"
+
+          $uri = "https://api.github.com/repos/$repo/contents/$path?ref=$sha"
+          Write-Host "Downloading: $uri"
+
+          $resp = Invoke-RestMethod `
+            -Uri $uri `
+            -Headers @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = "application/vnd.github+json"
+              "User-Agent"  = "github-actions"
+            }
+
+          if (-not $resp.content) { throw "GitHub API response missing content for $path" }
+
+          $bytes = [Convert]::FromBase64String($resp.content)
           New-Item -ItemType Directory -Force -Path "tmp/appreq" | Out-Null
           [IO.File]::WriteAllBytes("tmp/appreq/app.yaml", $bytes)
 
-          Write-Host "Decoded YAML (first 20 lines):"
-          Get-Content "tmp/appreq/app.yaml" -TotalCount 20
-
-      - name: Validate YAML schema (orgname/app/env)
+      - name: Parse YAML and compute target
+        id: meta
         shell: pwsh
         run: |
-          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
-            Install-Module powershell-yaml -Scope CurrentUser -Force
-          }
+          Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
           $y = Get-Content "tmp/appreq/app.yaml" -Raw | ConvertFrom-Yaml
@@ -91,34 +84,26 @@ jobs:
             if (-not $y.$k) { throw "Missing required key '$k' in YAML" }
           }
 
-          if ([string]$y.env -notin @('DEV','TEST','PROD')) {
-            throw "YAML env must be DEV|TEST|PROD, got '$($y.env)'"
-          }
+          $org = [string]$y.orgname
+          $app = [string]$y.app
+          $env = ([string]$y.env).ToLower()
 
-          # Optional: ensure request matches workflow inputs (prevents confusion)
-          if ([string]$y.orgname -ne "${{ inputs.org }}") { throw "YAML orgname does not match inputs.org" }
-          if ([string]$y.app     -ne "${{ inputs.app }}") { throw "YAML app does not match inputs.app" }
-          if ([string]$y.env     -ne "${{ inputs.env }}") { throw "YAML env does not match inputs.env" }
-
-      - name: Prepare branch and target
-        id: prep
-        shell: pwsh
-        run: |
-          $org = "${{ inputs.org }}"
-          $app = "${{ inputs.app }}"
-          $env = "${{ inputs.env }}".ToLower()
+          if ($env -notin @('dev','test','prod')) { throw "env must be DEV|TEST|PROD" }
 
           $branch = "auto/$org-$app-$env-${{ github.run_id }}"
           $target = "apps/$org/$app-$env.yaml"
 
-          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "org=$org"       | Out-File $env:GITHUB_OUTPUT -Append
+          "app=$app"       | Out-File $env:GITHUB_OUTPUT -Append
+          "env=$env"       | Out-File $env:GITHUB_OUTPUT -Append
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Commit and push branch (auth0-apps)
+      - name: Commit and push branch
         shell: pwsh
         run: |
-          $branch = "${{ steps.prep.outputs.branch }}"
-          $target = "${{ steps.prep.outputs.target }}"
+          $branch = "${{ steps.meta.outputs.branch }}"
+          $target = "${{ steps.meta.outputs.target }}"
 
           git checkout -b $branch
 
@@ -130,28 +115,27 @@ jobs:
           git config user.email "auth0-automation@users.noreply.github.com"
 
           git add $target
-          git commit -m "Auth0 app request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
+          git commit -m "Auth0 app request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
           git push origin $branch
 
-      - name: Open PR (use GitHub App token)
+      - name: Open PR
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          $title = "Auth0 App Request: ${{ inputs.org }} / ${{ inputs.app }} / ${{ inputs.env }}"
-          $head  = "${{ steps.prep.outputs.branch }}"
+          $title = "Auth0 App Request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
+          $head  = "${{ steps.meta.outputs.branch }}"
           $base  = "master"
 
-          $bodyLines = @(
+          $body = @(
             "Automated Auth0 app registration request.",
             "",
             "Source repo: ${{ inputs.src_repo }}",
             "Commit:      ${{ inputs.src_sha }}",
             "Source file: ${{ inputs.yaml_path }}",
             "",
-            "Target file: ${{ steps.prep.outputs.target }}"
-          )
-          $body = $bodyLines -join "`n"
+            "Target file: ${{ steps.meta.outputs.target }}"
+          ) -join "`n"
 
           $payload = @{
             title = $title
