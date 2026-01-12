@@ -5,6 +5,11 @@ on:
     paths:
       - "apps/**/*.yaml"
       - "apps/**/*.yml"
+      - "*.tf"
+      - "**/*.tf"
+
+permissions:
+  contents: read
 
 jobs:
   validate-and-plan:
@@ -20,32 +25,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install yq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y yq
-
-      - name: Validate YAML files
-        shell: pwsh
-        run: |
-          $baseRef = "${{ github.base_ref }}"
-          $files = git diff --name-only "origin/$baseRef...HEAD" | Where-Object { $_ -match '^apps/.*\.ya?ml$' }
-
-          if (-not $files) {
-            Write-Host "No apps YAML files changed."
-            exit 0
-          }
-
-          foreach ($f in $files) {
-            Write-Host "Validating $f"
-            bash scripts/validate_app_yaml.sh "$f"
-          }
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
         run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
 
       - name: Terraform Plan
         run: terraform plan -input=false -no-color

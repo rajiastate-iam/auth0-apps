@@ -2,13 +2,18 @@ name: Apply Auth0 Changes
 
 on:
   push:
-    branches: ["master"]
+    branches: ["main", "master"]
     paths:
       - "apps/**/*.yaml"
       - "apps/**/*.yml"
+      - "*.tf"
+      - "**/*.tf"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: terraform-apply-master
+  group: terraform-apply
   cancel-in-progress: false
 
 jobs:
@@ -21,16 +26,9 @@ jobs:
       TF_VAR_auth0_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install yq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y yq
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
         run: terraform init -input=false
