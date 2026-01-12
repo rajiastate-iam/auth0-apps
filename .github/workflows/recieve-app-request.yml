@@ -37,7 +37,7 @@ jobs:
           "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Get GitHub App token (auth0-apps)
+      - name: Mint GitHub App token (from ORG secrets)
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
@@ -98,7 +98,6 @@ jobs:
 
           if ($env -notin @('dev','test','prod')) { throw "env must be dev|test|prod (got '$env')" }
 
-          # Basic safety validation
           if ($org -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid orgname: $org" }
           if ($app -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid app: $app" }
 
