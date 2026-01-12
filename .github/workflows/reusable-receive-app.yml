@@ -11,6 +11,13 @@ on:
       src_repo:   { required: true, type: string }
       src_sha:    { required: true, type: string }
 
+    # ✅ REQUIRED: declare secrets used by reusable workflow
+    secrets:
+      AUTH0_GHAPP_ID:
+        required: true
+      AUTH0_GHAPP_PRIVATE_KEY:
+        required: true
+
 permissions:
   contents: read
 
@@ -19,6 +26,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Sanity check secrets are available (safe)
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_ID }}")) {
+            throw "AUTH0_GHAPP_ID is not available to this reusable workflow run."
+          }
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}")) {
+            throw "AUTH0_GHAPP_PRIVATE_KEY is not available to this reusable workflow run."
+          }
+          Write-Host "Secrets are present."
+
       - name: Get GitHub App token (auth0-apps only)
         id: app-token
         uses: tibdex/github-app-token@v2
@@ -77,7 +95,7 @@ jobs:
             throw "YAML env must be DEV|TEST|PROD, got '$($y.env)'"
           }
 
-          # Optional: ensure request matches inputs (prevents tampering / confusion)
+          # Optional: ensure request matches workflow inputs (prevents confusion)
           if ([string]$y.orgname -ne "${{ inputs.org }}") { throw "YAML orgname does not match inputs.org" }
           if ([string]$y.app     -ne "${{ inputs.app }}") { throw "YAML app does not match inputs.app" }
           if ([string]$y.env     -ne "${{ inputs.env }}") { throw "YAML env does not match inputs.env" }
@@ -95,9 +113,6 @@ jobs:
 
           "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          Write-Host "branch=$branch"
-          Write-Host "target=$target"
 
       - name: Commit and push branch (auth0-apps)
         shell: pwsh
@@ -145,11 +160,9 @@ jobs:
             body  = $body
           } | ConvertTo-Json -Depth 6
 
-          $uri = "https://api.github.com/repos/${{ github.repository }}/pulls"
-
           Invoke-RestMethod `
             -Method POST `
-            -Uri $uri `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
             -Headers @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
