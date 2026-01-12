@@ -20,7 +20,6 @@ concurrency:
 jobs:
   apply:
     runs-on: ubuntu-latest
-
     env:
       AUTH0_DOMAIN:        ${{ secrets.AUTH0_DOMAIN }}
       AUTH0_CLIENT_ID:     ${{ secrets.AUTH0_CLIENT_ID }}
@@ -66,39 +65,39 @@ jobs:
           CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
         run: |
           $ErrorActionPreference = "Stop"
+          try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
-          $files = ConvertFrom-Json $env:CHANGED_JSON
-          $apps = @()
-          foreach ($path in $files) {
-            $apps += (Get-Content $path -Raw | ConvertFrom-Yaml)
+          $paths = ConvertFrom-Json $env:CHANGED_JSON
+          $apps  = @()
+          foreach ($p in $paths) {
+            $apps += (Get-Content $p -Raw | ConvertFrom-Yaml)
           }
           $tfvars = @{ apps = $apps }
-          $json = $tfvars | ConvertTo-Json -Depth 20
+          $json   = $tfvars | ConvertTo-Json -Depth 50
           Set-Content -Path "apps.auto.tfvars.json" -Value $json -Encoding UTF8
           Write-Host "Wrote apps.auto.tfvars.json with $($apps.Count) app(s)."
 
       - name: Terraform Init
         run: terraform init -input=false
 
-      # -------- PRE-IMPORT: make guarded resources updatable (fail BEFORE create) --------
+      # -------- PRE-IMPORT: import connection_clients to bypass provider guard --------
       - name: Preflight import auth0_connection_clients
         id: preflight
         shell: pwsh
         env:
-          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"  # keep in sync with Terraform main.tf
+          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"  # Keep in sync with Terraform root main.tf
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Get the changed YAMLs
-          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
-          if (-not $files -or $files.Count -eq 0) {
-            Write-Host "No apps to process in this push; skipping import."
+          $paths = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          if (-not $paths -or $paths.Count -eq 0) {
+            Write-Host "No apps to process; skipping import."
             exit 0
           }
 
-          # Management token
+          # Get Management API token
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
             client_id     = $env:AUTH0_CLIENT_ID
@@ -111,18 +110,18 @@ jobs:
           $token = $tokResp.access_token
           if (-not $token) { throw "Failed to get Auth0 Management API token." }
 
-          # Fetch ALL connections; filter by name in PS
+          # Fetch all connections once
           $conns = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
             -Headers @{ Authorization = "Bearer $token" }
 
-          # Managed connection names
           $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
 
-          # For each changed app, import connection_clients for each managed connection
+          # Import per app/env and per managed connection
+          try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
-          foreach ($path in $files) {
+          foreach ($path in $paths) {
             $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $org = [string]$obj.orgname
             $app = [string]$obj.app
@@ -133,7 +132,7 @@ jobs:
               $conn = $conns | Where-Object { $_.name -eq $name }
               if (-not $conn) { throw "Managed connection '$name' not found in tenant." }
               $connId = $conn.id
-              $addr = "module.auth0_app[`"$modKey`"].auth0_connection_clients.managed[`"$name`"]"
+              $addr   = "module.auth0_app[`"$modKey`"].auth0_connection_clients.managed[`"$name`"]"
               Write-Host "Importing $addr with connection ID $connId"
               terraform import "$addr" "$connId"
             }
@@ -157,7 +156,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Token
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
             client_id     = $env:AUTH0_CLIENT_ID
@@ -168,40 +166,42 @@ jobs:
           $tokResp = Invoke-RestMethod -Method Post -Uri "https://$($env:AUTH0_DOMAIN)/oauth/token" `
             -ContentType "application/json" -Body $body
           $token = $tokResp.access_token
-          if (-not $token) { throw "Failed to get Auth0 Management API token." }
+          if (-not $token) { throw "Failed to get Auth0 token for assertion." }
 
-          # Read back YAMLs and desired connections
-          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          $paths   = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
           $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
 
-          foreach ($path in $files) {
-            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
-            $display = [string]$obj.displayname
-            $want    = @($obj.connections) | Sort-Object -Unique
+          try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
+          Install-Module powershell-yaml -Scope CurrentUser -Force
+          Import-Module powershell-yaml
+
+          foreach ($path in $paths) {
+            $obj      = (Get-Content $path -Raw) | ConvertFrom-Yaml
+            $display  = [string]$obj.displayname
+            $wanted   = @($obj.connections) | Sort-Object -Unique
 
             # Resolve client_id by name
-            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
-              -Headers @{ Authorization = "Bearer $token" }
+            $clients  = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
+                          -Headers @{ Authorization = "Bearer $token" }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if (-not $clientId) { throw "Client '$display' not found after apply." }
 
-            # Check each managed connection for presence of clientId
             $bad = $false
             foreach ($name in $managed) {
-              $conn = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000" `
-                -Headers @{ Authorization = "Bearer $token" }
-              $p = ($conn | Where-Object { $_.name -eq $name })
-              if (-not $p) { throw "Connection '$name' not found during assertion." }
+              $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
+                           -Headers @{ Authorization = "Bearer $token" }
+              $conn = $connList | Where-Object { $_.name -eq $name }
+              if (-not $conn) { throw "Connection '$name' not found during assertion." }
 
-              $enabled = $p.enabled_clients
-              $has = ($enabled -contains $clientId)
-              $shouldHave = ($want -contains $name)
+              $enabled = @($conn.enabled_clients)
+              $has     = ($enabled -contains $clientId)
+              $should  = ($wanted -contains $name)
 
-              if ($shouldHave -and (-not $has)) {
+              if ($should -and (-not $has)) {
                 Write-Host "❌ Expected ENABLED on '$name' but not found."
                 $bad = $true
               }
-              if ((-not $shouldHave) -and $has) {
+              if ((-not $should) -and $has) {
                 Write-Host "❌ Expected DISABLED on '$name' but client is enabled."
                 $bad = $true
               }
@@ -230,17 +230,18 @@ jobs:
           $token = $tokResp.access_token
           if (-not $token) { Write-Host "No token; skipping cleanup."; exit 0 }
 
-          $files = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
-          if (-not $files -or $files.Count -eq 0) { Write-Host "No files; skip cleanup."; exit 0 }
+          $paths = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          if (-not $paths -or $paths.Count -eq 0) { Write-Host "No files; skip cleanup."; exit 0 }
 
+          try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
-          foreach ($path in $files) {
-            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
+          foreach ($path in $paths) {
+            $obj     = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $display = [string]$obj.displayname
             $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
-              -Headers @{ Authorization = "Bearer $token" }
+                        -Headers @{ Authorization = "Bearer $token" }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if ($clientId) {
               Write-Host "Deleting client '$display' ($clientId) due to failure."
