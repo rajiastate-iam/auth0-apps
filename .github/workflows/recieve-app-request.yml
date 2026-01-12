@@ -21,20 +21,23 @@ jobs:
           if (-not $event.client_payload) { throw "Missing client_payload" }
 
           $cp = $event.client_payload
-
-          $srcRepo = [string]$cp.src_repo
-          $srcSha  = [string]$cp.src_sha
+          $srcRepo  = [string]$cp.src_repo
+          $srcSha   = [string]$cp.src_sha
           $yamlPath = [string]$cp.yaml_path
 
-          if ($srcRepo -notmatch '^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$') { throw "bad src_repo: $srcRepo" }
-          if ($srcSha  -notmatch '^[0-9a-f]{7,40}$') { throw "bad src_sha: $srcSha" }
-          if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "bad yaml_path: $yamlPath" }
+          Write-Host "src_repo:  $srcRepo"
+          Write-Host "src_sha:   $srcSha"
+          Write-Host "yaml_path: $yamlPath"
 
-          "src_repo=$srcRepo"   | Out-File $env:GITHUB_OUTPUT -Append
-          "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append
-          "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append
+          if ($srcRepo -notmatch '^rajiastate-iam\/[A-Za-z0-9_.-]+$') { throw "src_repo not allowed: $srcRepo" }
+          if ($srcSha  -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
+          if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "yaml_path invalid: $yamlPath" }
 
-      - name: Get GitHub App token
+          "src_repo=$srcRepo"   | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Get GitHub App token (auth0-apps)
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
@@ -62,18 +65,21 @@ jobs:
           $resp = Invoke-RestMethod `
             -Uri $uri `
             -Headers @{
-              Authorization = "Bearer $env:GH_TOKEN"
+              Authorization = "token $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
               "User-Agent"  = "github-actions"
             }
 
-          if (-not $resp.content) { throw "Missing content for $path" }
+          if (-not $resp.content) { throw "GitHub API response missing content for $path" }
 
           $bytes = [Convert]::FromBase64String($resp.content)
           New-Item -ItemType Directory -Force -Path "tmp/appreq" | Out-Null
           [IO.File]::WriteAllBytes("tmp/appreq/app.yaml", $bytes)
 
-      - name: Parse YAML and compute target
+          Write-Host "Downloaded YAML first 15 lines:"
+          Get-Content "tmp/appreq/app.yaml" -TotalCount 15
+
+      - name: Parse YAML and compute branch/target
         id: meta
         shell: pwsh
         run: |
@@ -90,16 +96,20 @@ jobs:
           $app = [string]$y.app
           $env = ([string]$y.env).ToLower()
 
-          if ($env -notin @('dev','test','prod')) { throw "env must be dev|test|prod (got $env)" }
+          if ($env -notin @('dev','test','prod')) { throw "env must be dev|test|prod (got '$env')" }
+
+          # Basic safety validation
+          if ($org -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid orgname: $org" }
+          if ($app -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid app: $app" }
 
           $branch = "auto/$org-$app-$env-${{ github.run_id }}"
           $target = "apps/$org/$app-$env.yaml"
 
-          "org=$org"       | Out-File $env:GITHUB_OUTPUT -Append
-          "app=$app"       | Out-File $env:GITHUB_OUTPUT -Append
-          "env=$env"       | Out-File $env:GITHUB_OUTPUT -Append
-          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append
-          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append
+          "org=$org"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "app=$app"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "env=$env"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Commit and push branch
         id: commit
@@ -121,8 +131,8 @@ jobs:
           git commit -m "Auth0 app request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
           git push origin $branch
 
-          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append
-          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append
+          "branch=$branch" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "target=$target" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Open PR
         shell: pwsh
@@ -154,7 +164,7 @@ jobs:
             -Method POST `
             -Uri "https://api.github.com/repos/${{ github.repository }}/pulls" `
             -Headers @{
-              Authorization = "Bearer $env:GH_TOKEN"
+              Authorization = "token $env:GH_TOKEN"
               Accept        = "application/vnd.github+json"
               "User-Agent"  = "github-actions"
             } `
