@@ -69,3 +69,10 @@ clientmetadata:
 # Typical values: 3600 (1 hour), 1800 (30 mins), 900 (15 mins)
 jwtlifetimeinseconds: <JWT_LIFETIME_SECONDS>
 
+
+
+remove terraform state commands
+
+
+Remove-Item -Force terraform.tfstate, terraform.tfstate.backup, .terraform.lock.hcl
+Remove-Item -Recurse -Force .terraform
