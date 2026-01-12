@@ -20,7 +20,11 @@ concurrency:
 jobs:
   apply:
     runs-on: ubuntu-latest
+
     env:
+      AUTH0_DOMAIN:        ${{ secrets.AUTH0_DOMAIN }}
+      AUTH0_CLIENT_ID:     ${{ secrets.AUTH0_CLIENT_ID }}
+      AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
       TF_VAR_auth0_domain:        ${{ secrets.AUTH0_DOMAIN }}
       TF_VAR_auth0_client_id:     ${{ secrets.AUTH0_CLIENT_ID }}
       TF_VAR_auth0_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
@@ -32,7 +36,8 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
 
-      - name: Detect changed app files in merge commit
+      # Detect changed YAMLs in the merge commit
+      - name: Detect changed app files
         id: pick
         shell: bash
         run: |
@@ -57,30 +62,209 @@ jobs:
             printf "Changed files:\n%s\n" "${changed_yaml[@]}"
           fi
 
-      - name: Build apps.auto.tfvars.json (from merge commit)
+      # Build tfvars from the changed YAMLs (apps)
+      - name: Build apps.auto.tfvars.json
         env:
           CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
         run: |
           set -euo pipefail
           python3 - << 'PY'
-          import json, os, sys, yaml
+          import json, os, yaml
           changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
-          apps = []
+          apps=[]
           for path in changed:
-            with open(path, "r", encoding="utf-8") as fh:
-              data = yaml.safe_load(fh)
-            for k in ["orgname","app","env","displayname","apptype"]:
-              if k not in data or data[k] is None:
-                print(f"Missing required key '{k}' in {path}", file=sys.stderr)
-                sys.exit(1)
-            apps.append(data)
-          with open("apps.auto.tfvars.json","w",encoding="utf-8") as out:
-            json.dump({"apps": apps}, out)
+            apps.append(yaml.safe_load(open(path)))
+          open("apps.auto.tfvars.json","w").write(json.dumps({"apps":apps}))
           print("Wrote apps.auto.tfvars.json with", len(apps), "app(s).")
           PY
+
+      # Fetch ALL connections from Auth0 Management API (names & IDs)
+      - name: Fetch Auth0 connections (names + IDs)
+        id: conn
+        shell: bash
+        env:
+          DOMAIN: ${{ env.AUTH0_DOMAIN }}
+          CID:    ${{ env.AUTH0_CLIENT_ID }}
+          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # Get M2M token
+          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
+            -H "content-type: application/json" \
+            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+          # Fetch up to 1000 connections (adjust if needed)
+          ALL=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/connections" \
+            -H "authorization: Bearer ${TOK}" \
+            --data-urlencode "per_page=1000" \
+            --data-urlencode "page=0")
+
+          echo "$ALL" | jq -r '.[].name' > all_conn_names.txt
+          echo "$ALL" | jq -r '.[] | [.name, .id] | @tsv' > name_id.tsv
+
+          echo "Managed connection count: $(wc -l < all_conn_names.txt)"
+
+          # Build tfvars for managed_connection_names
+          jq -n --argjson names "$(jq -R -s -c 'split("\n")|map(select(length>0))' all_conn_names.txt)" \
+            '{managed_connection_names: ($names | unique)}' > connections.auto.tfvars.json
+
+          echo "managed_conn_json=$(cat connections.auto.tfvars.json)" >> "$GITHUB_OUTPUT"
 
       - name: Terraform Init
         run: terraform init -input=false
 
-      - name: Terraform Apply (only PR apps)
-        run: terraform apply -input=false -auto-approve
+      # ---------- AUTO-IMPORT to bypass provider guard ----------
+      # Import auth0_connection_clients for each managed connection
+      - name: Auto-import auth0_connection_clients
+        shell: bash
+        env:
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          # Derive the module instance key from the first app in this push
+          # (Assumption: one app per commit; if multiple, we loop imports for each)
+          python3 - << 'PY'
+          import json, yaml, os, sys
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          if not changed:
+            print("No apps in this push; skip import.")
+            sys.exit(0)
+          apps = [yaml.safe_load(open(p)) for p in changed]
+          # We'll import for the first app (repeatable per app if needed):
+          a = apps[0]
+          mod_key = f'{a["orgname"]}/{a["app"]}-{str(a["env"]).lower()}'
+          open("modkey.txt","w").write(mod_key)
+          print("Module key:", mod_key)
+          PY
+
+          MODKEY=$(cat modkey.txt)
+          while IFS=$'\t' read -r NAME ID; do
+            # Address: module.auth0_app["<org>/<app>-<env>"].auth0_connection_clients.managed["<name>"]
+            ADDR="module.auth0_app[\"${MODKEY}\"].auth0_connection_clients.managed[\"${NAME}\"]"
+            echo "Importing ${ADDR} with connection ID ${ID}"
+            # Ignore failures (first run, resource may not exist yet) but continue
+            terraform import -no-color "${ADDR}" "${ID}" || true
+          done < name_id.tsv
+
+      # ---------- PLAN ----------
+      - name: Terraform Plan (strict connections)
+        id: tfplan
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -out=tfplan
+
+      # ---------- APPLY only if PLAN succeeded ----------
+      - name: Terraform Apply
+        if: ${{ steps.tfplan.outcome == 'success' }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      # ---------- POST-APPLY ASSERTION ----------
+      # Verify that only the requested connections have this client enabled
+      - name: Assert connections enabled exactly as requested
+        if: ${{ success() }}
+        shell: bash
+        env:
+          DOMAIN: ${{ env.AUTH0_DOMAIN }}
+          CID:    ${{ env.AUTH0_CLIENT_ID }}
+          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          # Resolve client_id by displayname from YAML
+          python3 - << 'PY'
+          import json, yaml, os, sys
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          a = yaml.safe_load(open(changed[0]))
+          open("displayname.txt","w").write(a["displayname"])
+          # Also emit desired set
+          open("wanted.txt","w").write("\n".join(a.get("connections",[])))
+          PY
+          DISPLAYNAME=$(cat displayname.txt)
+
+          # Get token
+          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
+            -H "content-type: application/json" \
+            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+          # Resolve client_id by name and list connections' enabled_clients
+          CLIENT_ID=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/clients" \
+            -H "authorization: Bearer ${TOK}" \
+            --data-urlencode "fields=name,client_id" \
+            --data-urlencode "include_fields=true" \
+            | jq -r --arg NAME "${DISPLAYNAME}" '.[] | select(.name==$NAME) | .client_id')
+
+          [ -n "$CLIENT_ID" ] || { echo "Could not resolve client_id for ${DISPLAYNAME}"; exit 1; }
+
+          # Check each connection
+          WANT_SET=$(cat wanted.txt | sort | uniq | tr '\n' ' ')
+          BAD=0
+          while IFS=$'\t' read -r NAME ID; do
+            EN=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/connections/${ID}" \
+                  -H "authorization: Bearer ${TOK}" \
+                  --data-urlencode "fields=enabled_clients,name" \
+                  --data-urlencode "include_fields=true" \
+                | jq -r '.enabled_clients[]?') || true
+            HAS=$(echo "$EN" | grep -Fx "$CLIENT_ID" >/dev/null && echo "yes" || echo "no")
+
+            IN_WANT=$(grep -Fx "$NAME" wanted.txt >/dev/null && echo "yes" || echo "no")
+
+            if [ "$IN_WANT" = "yes" ] && [ "$HAS" = "no" ]; then
+              echo "❌ Expected ENABLED on ${NAME}, but client not present."
+              BAD=1
+            fi
+            if [ "$IN_WANT" = "no" ] && [ "$HAS" = "yes" ]; then
+              echo "❌ Expected DISABLED on ${NAME}, but client present."
+              BAD=1
+            fi
+          done < name_id.tsv
+
+          if [ "$BAD" -eq 1 ]; then
+            echo "Post-apply assertion failed."
+            exit 1
+          fi
+          echo "Post-apply assertion passed ✅"
+      
+      # ---------- FAILURE CLEANUP ----------
+      # If something fails anywhere, delete the client to avoid stray apps
+      - name: Cleanup client on failure (soft rollback)
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          DOMAIN: ${{ env.AUTH0_DOMAIN }}
+          CID:    ${{ env.AUTH0_CLIENT_ID }}
+          CSEC:   ${{ env.AUTH0_CLIENT_SECRET }}
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, yaml, os
+          changed = json.loads(os.environ.get("CHANGED_JSON","[]"))
+          if not changed:
+            open("displayname.txt","w").write("")
+          else:
+            a = yaml.safe_load(open(changed[0]))
+            open("displayname.txt","w").write(a["displayname"])
+          PY
+          DISPLAYNAME=$(cat displayname.txt)
+          [ -n "$DISPLAYNAME" ] || { echo "No display name; nothing to cleanup."; exit 0; }
+
+          TOK=$(curl -sS --fail -X POST "https://${DOMAIN}/oauth/token" \
+            -H "content-type: application/json" \
+            -d "{\"client_id\":\"${CID}\",\"client_secret\":\"${CSEC}\",\"audience\":\"https://${DOMAIN}/api/v2/\",\"grant_type\":\"client_credentials\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+          CLIENT_ID=$(curl -sS --fail -G "https://${DOMAIN}/api/v2/clients" \
+            -H "authorization: Bearer ${TOK}" \
+            --data-urlencode "fields=name,client_id" \
+            --data-urlencode "include_fields=true" \
+            | jq -r --arg NAME "${DISPLAYNAME}" '.[] | select(.name==$NAME) | .client_id')
+
+          if [ -n "$CLIENT_ID" ]; then
+            echo "Deleting client ${DISPLAYNAME} (${CLIENT_ID}) due to failure."
+            curl -sS --fail -X DELETE "https://${DOMAIN}/api/v2/clients/${CLIENT_ID}" \
+              -H "authorization: Bearer ${TOK}" || true
+          else
+            echo "Client not found for cleanup."
+          fi

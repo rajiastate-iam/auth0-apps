@@ -15,7 +15,7 @@ locals {
       metadata     = try(a.clientmetadata, {})
       jwt_ttl      = try(a.jwtlifetimeinseconds, 3600)
       snow_req     = try(a.servicenow_req, null)
-      connections  = toset(try(a.connections, []))
+      connections  = toset(try(a.connections, [])) # only these must be ON
     }
   }
 }
@@ -36,7 +36,7 @@ module "auth0_app" {
   org_name                 = each.value.orgname
   servicenow_req           = each.value.snow_req
 
-  # NEW: connections control
+  # Strict connection control
   connections              = each.value.connections
-  managed_connection_names = ["CustomersDB", "azure-ad-prod"]  # or make this a root var
+  managed_connection_names = var.managed_connection_names
 }

@@ -35,12 +35,19 @@ variable "connections" {
   default = []
 }
 
-# Managed connection names (the set we control strictly via Terraform)
-# You can keep this as exactly the two you mentioned, or widen later.
-variable "managed_connection_names" {
-  type    = set(string)
-  default = ["CustomersDB", "azure-ad-prod"]
+
+variable "connections" {
+  description = "Names of connections to enable for this client."
+  type        = set(string)
+  default     = []
 }
+
+variable "managed_connection_names" {
+  description = "All connection names that we manage strictly for this client."
+  type        = set(string)
+  default     = []
+}
+
 
 variable "org_name" {}
 variable "servicenow_req" {}

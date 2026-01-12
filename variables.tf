@@ -1,5 +1,6 @@
+
 ######################################################
-# Provider variables
+# Provider variables (keep your existing ones)
 ######################################################
 variable "auth0_domain" {
   type        = string
@@ -18,11 +19,9 @@ variable "auth0_client_secret" {
   description = "Auth0 management API client secret"
 }
 
-
 ######################################################
-# App specs supplied by the workflow (PR-driven)
+# NEW: App specs provided by workflow (from PR)
 ######################################################
-
 variable "apps" {
   description = "List of Auth0 app specifications to apply in this run."
   type = list(object({
@@ -38,7 +37,17 @@ variable "apps" {
     clientmetadata        = optional(map(string), {})
     jwtlifetimeinseconds  = optional(number, 3600)
     servicenow_req        = optional(string)
-    connections           = optional(list(string), [])
+    connections           = optional(list(string), []) # e.g., ["CustomersDB","azure-ad-prod"]
   }))
   default = []
+}
+
+######################################################
+# NEW: Strict management list (names of all connections
+# we will enforce ON/OFF for this client)
+######################################################
+variable "managed_connection_names" {
+  description = "All connection names to enforce enable/disable for the client."
+  type        = set(string)
+  default     = []
 }
