@@ -17,6 +17,8 @@ jobs:
         id: p
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
           if (-not $event.client_payload) { throw "Missing client_payload" }
 
@@ -29,6 +31,7 @@ jobs:
           Write-Host "src_sha:   $srcSha"
           Write-Host "yaml_path: $yamlPath"
 
+          # allowlist org + basic validation
           if ($srcRepo -notmatch '^rajiastate-iam\/[A-Za-z0-9_.-]+$') { throw "src_repo not allowed: $srcRepo" }
           if ($srcSha  -notmatch '^[0-9a-f]{7,40}$') { throw "src_sha invalid: $srcSha" }
           if ($yamlPath -notmatch '^apps\/.*\.ya?ml$') { throw "yaml_path invalid: $yamlPath" }
@@ -37,12 +40,14 @@ jobs:
           "src_sha=$srcSha"     | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "yaml_path=$yamlPath" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Mint GitHub App token (from ORG secrets)
+      - name: Mint GitHub App token (ORG secrets)
         id: app-token
         uses: tibdex/github-app-token@v2
         with:
           app_id: ${{ secrets.AUTH0_GHAPP_ID }}
           private_key: ${{ secrets.AUTH0_GHAPP_PRIVATE_KEY }}
+          owner: rajiastate-iam
+          repositories: auth0-apps
 
       - name: Checkout auth0-apps (with App token)
         uses: actions/checkout@v4
@@ -50,19 +55,27 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Download YAML from source repo at exact commit
+      - name: Download YAML from source repo at exact commit (FIXED URL)
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           $repo = "${{ steps.p.outputs.src_repo }}"
           $sha  = "${{ steps.p.outputs.src_sha }}"
           $path = "${{ steps.p.outputs.yaml_path }}"
 
-          $uri = "https://api.github.com/repos/$repo/contents/$path?ref=$sha"
+          if ($path -notmatch '^apps\/.*\.ya?ml$') { throw "Bad yaml_path: $path" }
+
+          # Correct Contents API URL: /contents/{path}?ref={sha}
+          $encodedPath = [System.Uri]::EscapeDataString($path).Replace("%2F","/")
+          $uri = "https://api.github.com/repos/$repo/contents/$encodedPath?ref=$sha"
+
           Write-Host "Downloading: $uri"
 
           $resp = Invoke-RestMethod `
+            -Method GET `
             -Uri $uri `
             -Headers @{
               Authorization = "token $env:GH_TOKEN"
@@ -73,16 +86,19 @@ jobs:
           if (-not $resp.content) { throw "GitHub API response missing content for $path" }
 
           $bytes = [Convert]::FromBase64String($resp.content)
+
           New-Item -ItemType Directory -Force -Path "tmp/appreq" | Out-Null
           [IO.File]::WriteAllBytes("tmp/appreq/app.yaml", $bytes)
 
-          Write-Host "Downloaded YAML first 15 lines:"
-          Get-Content "tmp/appreq/app.yaml" -TotalCount 15
+          Write-Host "Downloaded YAML first 20 lines:"
+          Get-Content "tmp/appreq/app.yaml" -TotalCount 20
 
       - name: Parse YAML and compute branch/target
         id: meta
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
@@ -114,6 +130,8 @@ jobs:
         id: commit
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $branch = "${{ steps.meta.outputs.branch }}"
           $target = "${{ steps.meta.outputs.target }}"
 
@@ -138,6 +156,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           $title = "Auth0 App Request: ${{ steps.meta.outputs.org }} / ${{ steps.meta.outputs.app }} / ${{ steps.meta.outputs.env }}"
           $head  = "${{ steps.commit.outputs.branch }}"
           $base  = "master"
