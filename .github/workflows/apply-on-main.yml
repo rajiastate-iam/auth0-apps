@@ -73,7 +73,9 @@ jobs:
           if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
 
           $apps  = @()
-          foreach ($p in $paths) { $apps += (Get-Content $p -Raw | ConvertFrom-Yaml) }
+          foreach ($p in $paths) {
+            $apps += (Get-Content $p -Raw | ConvertFrom-Yaml)
+          }
           $tfvars = @{ apps = $apps }
           $json   = $tfvars | ConvertTo-Json -Depth 50
           Set-Content -Path "apps.auto.tfvars.json" -Value $json -Encoding UTF8
@@ -98,8 +100,8 @@ jobs:
         run: |
           $clientIdsOut = terraform output -json client_ids
           $allowedOut   = terraform output -json allowed_connection_ids
-          "client_ids_json=$clientIdsOut"   | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "allowed_ids_json=$allowedOut"    | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "client_ids_json=$clientIdsOut" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "allowed_ids_json=$allowedOut"  | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # ---------- POST-APPLY ASSERT + CORRECT ----------
       - name: Ensure only allowed connections are enabled for each client
@@ -111,15 +113,19 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          # Parse changed YAML paths
           $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
           if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
 
-          # Parse TF outputs
-          $clientIdsObj = ConvertFrom-Json $env:CLIENT_IDS_JSON
-          $clientIdsMap = $clientIdsObj.value  # map: <org>/<app>-<env> => client_id
+          # Robustly parse Terraform outputs (raw value OR { "value": ... })
+          function Get-Value($json) {
+            $obj = ConvertFrom-Json $json
+            if ($obj -is [System.Collections.IDictionary] -and $obj.ContainsKey("value")) { return $obj.value }
+            return $obj
+          }
 
-          $allowedObj = ConvertFrom-Json $env:ALLOWED_IDS_JSON
-          $allowed    = @($allowedObj.value)   # array of connection IDs
+          $clientIdsMap = Get-Value $env:CLIENT_IDS_JSON   # map: <org>/<app>-<env> => client_id
+          $allowed      = Get-Value $env:ALLOWED_IDS_JSON  # array of connection IDs
 
           # Get Management API token
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
@@ -142,10 +148,18 @@ jobs:
             $obj    = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $modKey = "{0}/{1}-{2}" -f [string]$obj.orgname, [string]$obj.app, ([string]$obj.env).ToLower()
 
+            # Lookup client_id from TF output (case-insensitive fallback)
             $clientId = $clientIdsMap.$modKey
-            if (-not $clientId) { throw "Client ID not found in Terraform outputs for $modKey." }
+            if (-not $clientId) {
+              $match = $clientIdsMap.GetEnumerator() | Where-Object { $_.Key.ToString().ToLower() -eq $modKey.ToLower() }
+              $clientId = $match.Value
+            }
+            if (-not $clientId) {
+              Write-Host "Available keys in client_ids:"; $clientIdsMap.Keys | ForEach-Object { Write-Host " - $_" }
+              throw "Client ID not found in Terraform outputs for $modKey."
+            }
 
-            # Page through all connections (fix '&amp;' -> '&')
+            # Page through ALL connections (Auth0 enforces pagination)
             $connList = @()
             $page = 0
             while ($true) {
@@ -223,6 +237,8 @@ jobs:
           foreach ($path in $paths) {
             $obj     = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $display = [string]$obj.displayname
+
+            # Page through clients (Auth0 paginates /clients)
             $clients = @()
             $page = 0
             while ($true) {
@@ -233,6 +249,7 @@ jobs:
               $clients += $resp
               $page++
             }
+
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if ($clientId) {
               Write-Host "Deleting client '$display' ($clientId) due to failure."
