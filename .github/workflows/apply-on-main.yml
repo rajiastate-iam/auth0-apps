@@ -116,7 +116,7 @@ jobs:
           if (-not $token) { throw "Failed to get Auth0 Management API token." }
 
           # Fetch all connections once
-          $conns = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
+          $conns = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=0" `
             -Headers @{ Authorization = "Bearer $token" }
 
           $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
@@ -188,14 +188,14 @@ jobs:
             $wanted   = @($obj.connections) | Sort-Object -Unique
 
             # Resolve client_id by name
-            $clients  = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
+            $clients  = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100" `
                           -Headers @{ Authorization = "Bearer $token" }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if (-not $clientId) { throw "Client '$display' not found after apply." }
 
             $bad = $false
             # Get connections once per loop; we could cache but this is fine
-            $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
+            $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=0" `
                           -Headers @{ Authorization = "Bearer $token" }
 
             foreach ($name in $managed) {
@@ -252,7 +252,7 @@ jobs:
           foreach ($path in $paths) {
             $obj     = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $display = [string]$obj.displayname
-            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=1000" `
+            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100" `
                         -Headers @{ Authorization = "Bearer $token" }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if ($clientId) {
