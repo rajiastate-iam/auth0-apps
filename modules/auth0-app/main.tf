@@ -33,17 +33,14 @@ resource "auth0_client" "app" {
   is_first_party = true
 }
 
-# Lookup each managed connection by name
-data "auth0_connection" "managed" {
-  for_each = var.managed_connection_names
-  name     = each.key
+# Enable exactly the two static connections for this client.
+# This resource does NOT manage other clients on those connections.
+resource "auth0_connection_client" "primary" {
+  connection_id = var.primary_connection_id
+  client_id     = auth0_client.app.client_id
 }
 
-# STRICT enforcement:
-# - If connection name is listed in var.connections -> enable this client
-# - Else -> ensure this client is NOT enabled on that connection
-resource "auth0_connection_clients" "managed" {
-  for_each       = data.auth0_connection.managed
-  connection_id  = each.value.id
-  enabled_clients = contains(var.connections, each.key) ? [auth0_client.app.id] : []
+resource "auth0_connection_client" "secondary" {
+  connection_id = var.secondary_connection_id
+  client_id     = auth0_client.app.client_id
 }

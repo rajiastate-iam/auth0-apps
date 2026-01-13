@@ -28,6 +28,10 @@ jobs:
       TF_VAR_auth0_client_id:     ${{ secrets.AUTH0_CLIENT_ID }}
       TF_VAR_auth0_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
 
+      # >>>> FILL WITH THE SAME STATIC IDs AS locals.tf <<<<
+      # These are NOT secrets; IDs are fine to log. Keeping here keeps GH workflow self-contained.
+      ALLOWED_CONNECTION_IDS: "con_aaaaaaaaaaaaaaaa,con_bbbbbbbbbbbbbbbb"
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,65 +88,7 @@ jobs:
       - name: Terraform Init
         run: terraform init -input=false
 
-      # -------- PRE-IMPORT: import connection_clients to bypass provider guard --------
-      - name: Preflight import auth0_connection_clients
-        id: preflight
-        shell: pwsh
-        env:
-          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"
-          CHANGED_JSON:        ${{ steps.pick.outputs.changed_json }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Robustly parse file list
-          $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
-          if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
-          if (-not $paths -or $paths.Count -eq 0) {
-            Write-Host "No apps to process; skipping import."
-            exit 0
-          }
-
-          # Get Management API token
-          $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
-          $body = @{
-            client_id     = $env:AUTH0_CLIENT_ID
-            client_secret = $env:AUTH0_CLIENT_SECRET
-            audience      = $aud
-            grant_type    = "client_credentials"
-          } | ConvertTo-Json
-          $tokResp = Invoke-RestMethod -Method Post -Uri "https://$($env:AUTH0_DOMAIN)/oauth/token" `
-            -ContentType "application/json" -Body $body
-          $token = $tokResp.access_token
-          if (-not $token) { throw "Failed to get Auth0 Management API token." }
-
-          # Fetch all connections once
-          $conns = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=0" `
-            -Headers @{ Authorization = "Bearer $token" }
-
-          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
-
-          try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
-          Install-Module powershell-yaml -Scope CurrentUser -Force
-          Import-Module powershell-yaml
-
-          foreach ($path in $paths) {
-            $obj = (Get-Content $path -Raw) | ConvertFrom-Yaml
-            $org = [string]$obj.orgname
-            $app = [string]$obj.app
-            $env = ([string]$obj.env).ToLower()
-            $modKey = "$org/$app-$env"
-
-            foreach ($name in $managed) {
-              $conn = $conns | Where-Object { $_.name -eq $name }
-              if (-not $conn) { throw "Managed connection '$name' not found in tenant." }
-              $connId = $conn.id
-              $addr   = "module.auth0_app[`"$modKey`"].auth0_connection_clients.managed[`"$name`"]"
-              Write-Host "Importing $addr with connection ID $connId"
-              terraform import "$addr" "$connId"
-            }
-          }
-
-      - name: Terraform Plan (strict connections)
+      - name: Terraform Plan
         id: tfplan
         run: terraform plan -input=false -no-color -out=tfplan
 
@@ -152,17 +98,22 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
 
-      # ---------- POST-APPLY ASSERTION ----------
-      - name: Assert connections enabled only as requested
+      # ---------- POST-APPLY ASSERT + CORRECT ----------
+      - name: Ensure only allowed connections are enabled for each client
         shell: pwsh
         env:
-          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"
-          CHANGED_JSON:        ${{ steps.pick.outputs.changed_json }}
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
           if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
+
+          # Build allowed list from env (static IDs)
+          $allowed = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:ALLOWED_CONNECTION_IDS)) {
+            $allowed = $env:ALLOWED_CONNECTION_IDS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+          }
 
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
@@ -180,44 +131,53 @@ jobs:
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
-          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
-
           foreach ($path in $paths) {
             $obj      = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $display  = [string]$obj.displayname
-            $wanted   = @($obj.connections) | Sort-Object -Unique
 
-            # Resolve client_id by name
+            # Resolve client_id by display name
             $clients  = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100" `
                           -Headers @{ Authorization = "Bearer $token" }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if (-not $clientId) { throw "Client '$display' not found after apply." }
 
-            $bad = $false
-            # Get connections once per loop; we could cache but this is fine
+            # Fetch all connections and ensure only allowed set has this client enabled
             $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=0" `
                           -Headers @{ Authorization = "Bearer $token" }
 
-            foreach ($name in $managed) {
-              $conn = $connList | Where-Object { $_.name -eq $name }
-              if (-not $conn) { throw "Connection '$name' not found during assertion." }
-
+            $bad = $false
+            foreach ($conn in $connList) {
+              $cid = $conn.id
               $enabled = @($conn.enabled_clients)
               $has     = ($enabled -contains $clientId)
-              $should  = ($wanted -contains $name)
+              $should  = ($allowed -contains $cid)
 
               if ($should -and (-not $has)) {
-                Write-Host "❌ Expected ENABLED on '$name' but not found."
-                $bad = $true
+                # Add this client to allowed connections if missing
+                $new = @($enabled + $clientId | Sort-Object -Unique)
+                Invoke-RestMethod -Method Patch `
+                  -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections/$cid" `
+                  -Headers @{ Authorization = "Bearer $token" } `
+                  -ContentType "application/json" `
+                  -Body ( @{ enabled_clients = $new } | ConvertTo-Json )
               }
-              if ((-not $should) -and $has) {
-                Write-Host "❌ Expected DISABLED on '$name' but client is enabled."
+              elseif ((-not $should) -and $has) {
+                # Remove from non-allowed connections
+                $new = @($enabled | Where-Object { $_ -ne $clientId })
+                Invoke-RestMethod -Method Patch `
+                  -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections/$cid" `
+                  -Headers @{ Authorization = "Bearer $token" } `
+                  -ContentType "application/json" `
+                  -Body ( @{ enabled_clients = $new } | ConvertTo-Json )
                 $bad = $true
               }
             }
 
-            if ($bad) { throw "Post-apply assertion failed for '$display'." }
-            Write-Host "Post-apply assertion passed for '$display' ✅"
+            if ($bad) {
+              Write-Host "Adjusted connections for '$display' to only allowed set."
+            } else {
+              Write-Host "Post-apply assertion passed for '$display' ✅"
+            }
           }
 
       # ---------- FAILURE CLEANUP ----------

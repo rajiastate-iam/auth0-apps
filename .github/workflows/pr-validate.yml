@@ -58,12 +58,8 @@ jobs:
           Import-Module powershell-yaml
 
           $paths = ConvertFrom-Json $env:CHANGED_JSON
-          if (-not $paths -or $paths.Count -eq 0) {
-            Write-Host "No app YAMLs changed; skipping validation."
-            exit 0
-          }
+          if (-not $paths -or $paths.Count -eq 0) { Write-Host "No app YAMLs changed; skipping validation."; exit 0 }
 
-          $allowedConns = @("CustomersDB","azure-ad-prod")
           $errors = @()
 
           function Check-Urls($urls, $field) {
@@ -101,24 +97,10 @@ jobs:
             Check-Urls $obj.callbacks      'callbacks'
             Check-Urls $obj.logouturls     'logouturls'
             Check-Urls $obj.allowedorigins 'allowedorigins'
-
-            $conns   = @($obj.connections)
-            $unknown = $conns | Where-Object { $_ -notin $allowedConns }
-            if ($unknown.Count -gt 0) {
-              $errors += "$($path): unsupported connections $($unknown -join ', '). Allowed: $($allowedConns -join ', ')"
-            }
-            if ($conns.Count -eq 0) {
-              $errors += "$($path): 'connections' must include at least one of $($allowedConns -join ', ')"
-            }
           }
 
-          if ($errors.Count -gt 0) {
-            Write-Host "VALIDATION FAILED:"
-            $errors | ForEach-Object { Write-Host " - $_" }
-            exit 1
-          } else {
-            Write-Host "Validation passed ✅"
-          }
+          if ($errors.Count -gt 0) { Write-Host "VALIDATION FAILED:"; $errors | % { Write-Host " - $_" }; exit 1 }
+          Write-Host "Validation passed ✅"
 
       - uses: hashicorp/setup-terraform@v3
 
@@ -133,9 +115,7 @@ jobs:
 
           $paths = ConvertFrom-Json $env:CHANGED_JSON
           $apps  = @()
-          foreach ($p in $paths) {
-            $apps += (Get-Content $p -Raw | ConvertFrom-Yaml)
-          }
+          foreach ($p in $paths) { $apps += (Get-Content $p -Raw | ConvertFrom-Yaml) }
           $tfvars = @{ apps = $apps }
           $json   = $tfvars | ConvertTo-Json -Depth 50
           Set-Content -Path "apps.auto.tfvars.json" -Value $json -Encoding UTF8

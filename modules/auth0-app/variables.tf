@@ -1,13 +1,9 @@
+
 variable "display_name" {}
 variable "app_type" {}
 
-variable "grant_types" {
-  type = list(string)
-}
-
-variable "callbacks" {
-  type = list(string)
-}
+variable "grant_types" { type = list(string) }
+variable "callbacks"   { type = list(string) }
 
 variable "logout_urls" {
   type    = list(string)
@@ -29,20 +25,9 @@ variable "jwt_lifetime_in_seconds" {
   default = 3600
 }
 
-
-
-variable "connections" {
-  description = "Names of connections to enable for this client."
-  type        = set(string)
-  default     = []
-}
-
-variable "managed_connection_names" {
-  description = "All connection names that we manage strictly for this client."
-  type        = set(string)
-  default     = []
-}
-
-
 variable "org_name" {}
 variable "servicenow_req" {}
+
+# NEW: two static connection IDs (from root locals)
+variable "primary_connection_id"   { type = string }
+variable "secondary_connection_id" { type = string }
