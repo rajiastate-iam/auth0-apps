@@ -69,7 +69,9 @@ jobs:
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
 
-          $paths = ConvertFrom-Json $env:CHANGED_JSON
+          $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
+          if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
+
           $apps  = @()
           foreach ($p in $paths) {
             $apps += (Get-Content $p -Raw | ConvertFrom-Yaml)
@@ -87,11 +89,14 @@ jobs:
         id: preflight
         shell: pwsh
         env:
-          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"  # Keep in sync with Terraform root main.tf
+          MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"
+          CHANGED_JSON:        ${{ steps.pick.outputs.changed_json }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $paths = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
+          # Robustly parse file list
+          $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
+          if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
           if (-not $paths -or $paths.Count -eq 0) {
             Write-Host "No apps to process; skipping import."
             exit 0
@@ -116,7 +121,6 @@ jobs:
 
           $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
 
-          # Import per app/env and per managed connection
           try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
@@ -153,8 +157,12 @@ jobs:
         shell: pwsh
         env:
           MANAGED_CONNECTIONS: "CustomersDB,azure-ad-prod"
+          CHANGED_JSON:        ${{ steps.pick.outputs.changed_json }}
         run: |
           $ErrorActionPreference = "Stop"
+
+          $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
+          if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
 
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
@@ -168,12 +176,11 @@ jobs:
           $token = $tokResp.access_token
           if (-not $token) { throw "Failed to get Auth0 token for assertion." }
 
-          $paths   = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
-          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
-
           try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
           Import-Module powershell-yaml
+
+          $managed = $env:MANAGED_CONNECTIONS -split ',' | ForEach-Object { $_.Trim() }
 
           foreach ($path in $paths) {
             $obj      = (Get-Content $path -Raw) | ConvertFrom-Yaml
@@ -187,9 +194,11 @@ jobs:
             if (-not $clientId) { throw "Client '$display' not found after apply." }
 
             $bad = $false
+            # Get connections once per loop; we could cache but this is fine
+            $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
+                          -Headers @{ Authorization = "Bearer $token" }
+
             foreach ($name in $managed) {
-              $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=1000&page=0" `
-                           -Headers @{ Authorization = "Bearer $token" }
               $conn = $connList | Where-Object { $_.name -eq $name }
               if (-not $conn) { throw "Connection '$name' not found during assertion." }
 
@@ -215,8 +224,14 @@ jobs:
       - name: Cleanup client on failure (soft rollback)
         if: ${{ failure() }}
         shell: pwsh
+        env:
+          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
         run: |
           $ErrorActionPreference = "Stop"
+
+          $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
+          if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
+          if (-not $paths -or $paths.Count -eq 0) { Write-Host "No files; skip cleanup."; exit 0 }
 
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
@@ -229,9 +244,6 @@ jobs:
             -ContentType "application/json" -Body $body
           $token = $tokResp.access_token
           if (-not $token) { Write-Host "No token; skipping cleanup."; exit 0 }
-
-          $paths = ConvertFrom-Json "${{ steps.pick.outputs.changed_json }}"
-          if (-not $paths -or $paths.Count -eq 0) { Write-Host "No files; skip cleanup."; exit 0 }
 
           try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
           Install-Module powershell-yaml -Scope CurrentUser -Force
