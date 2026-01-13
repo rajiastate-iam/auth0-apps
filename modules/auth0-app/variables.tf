@@ -28,6 +28,6 @@ variable "jwt_lifetime_in_seconds" {
 variable "org_name" {}
 variable "servicenow_req" {}
 
-# NEW: two static connection IDs (from root locals)
+# NEW: two static connection IDs (passed from root locals)
 variable "primary_connection_id"   { type = string }
 variable "secondary_connection_id" { type = string }

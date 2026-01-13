@@ -28,10 +28,6 @@ jobs:
       TF_VAR_auth0_client_id:     ${{ secrets.AUTH0_CLIENT_ID }}
       TF_VAR_auth0_client_secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
 
-      # >>>> FILL WITH THE SAME STATIC IDs AS locals.tf <<<<
-      # These are NOT secrets; IDs are fine to log. Keeping here keeps GH workflow self-contained.
-      ALLOWED_CONNECTION_IDS: "con_aaaaaaaaaaaaaaaa,con_bbbbbbbbbbbbbbbb"
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,9 +73,7 @@ jobs:
           if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
 
           $apps  = @()
-          foreach ($p in $paths) {
-            $apps += (Get-Content $p -Raw | ConvertFrom-Yaml)
-          }
+          foreach ($p in $paths) { $apps += (Get-Content $p -Raw | ConvertFrom-Yaml) }
           $tfvars = @{ apps = $apps }
           $json   = $tfvars | ConvertTo-Json -Depth 50
           Set-Content -Path "apps.auto.tfvars.json" -Value $json -Encoding UTF8
@@ -98,23 +92,36 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
 
+      - name: Capture Terraform outputs (client IDs + allowed connections)
+        id: tfout
+        shell: pwsh
+        run: |
+          $clientIdsOut = terraform output -json client_ids
+          $allowedOut   = terraform output -json allowed_connection_ids
+          "client_ids_json=$clientIdsOut"   | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "allowed_ids_json=$allowedOut"    | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       # ---------- POST-APPLY ASSERT + CORRECT ----------
       - name: Ensure only allowed connections are enabled for each client
         shell: pwsh
         env:
-          CHANGED_JSON: ${{ steps.pick.outputs.changed_json }}
+          CHANGED_JSON:     ${{ steps.pick.outputs.changed_json }}
+          CLIENT_IDS_JSON:  ${{ steps.tfout.outputs.client_ids_json }}
+          ALLOWED_IDS_JSON: ${{ steps.tfout.outputs.allowed_ids_json }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $paths = ConvertFrom-Json -InputObject $env:CHANGED_JSON
           if ($paths -isnot [System.Collections.IEnumerable]) { $paths = @($paths) }
 
-          # Build allowed list from env (static IDs)
-          $allowed = @()
-          if (-not [string]::IsNullOrWhiteSpace($env:ALLOWED_CONNECTION_IDS)) {
-            $allowed = $env:ALLOWED_CONNECTION_IDS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-          }
+          # Parse TF outputs
+          $clientIdsObj = ConvertFrom-Json $env:CLIENT_IDS_JSON
+          $clientIdsMap = $clientIdsObj.value  # map: <org>/<app>-<env> => client_id
 
+          $allowedObj = ConvertFrom-Json $env:ALLOWED_IDS_JSON
+          $allowed    = @($allowedObj.value)   # array of connection IDs
+
+          # Get Management API token
           $aud = "https://$env:AUTH0_DOMAIN/api/v2/"
           $body = @{
             client_id     = $env:AUTH0_CLIENT_ID
@@ -132,51 +139,55 @@ jobs:
           Import-Module powershell-yaml
 
           foreach ($path in $paths) {
-            $obj      = (Get-Content $path -Raw) | ConvertFrom-Yaml
-            $display  = [string]$obj.displayname
+            $obj    = (Get-Content $path -Raw) | ConvertFrom-Yaml
+            $modKey = "{0}/{1}-{2}" -f [string]$obj.orgname, [string]$obj.app, ([string]$obj.env).ToLower()
 
-            # Resolve client_id by display name
-            $clients  = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100" `
-                          -Headers @{ Authorization = "Bearer $token" }
-            $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
-            if (-not $clientId) { throw "Client '$display' not found after apply." }
+            $clientId = $clientIdsMap.$modKey
+            if (-not $clientId) { throw "Client ID not found in Terraform outputs for $modKey." }
 
-            # Fetch all connections and ensure only allowed set has this client enabled
-            $connList = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=0" `
-                          -Headers @{ Authorization = "Bearer $token" }
+            # Page through all connections (fix '&amp;' -> '&')
+            $connList = @()
+            $page = 0
+            while ($true) {
+              $resp = Invoke-RestMethod -Method Get `
+                -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections?per_page=100&page=$page" `
+                -Headers @{ Authorization = "Bearer $token" }
+              if (-not $resp -or $resp.Count -eq 0) { break }
+              $connList += $resp
+              $page++
+            }
 
-            $bad = $false
+            $adjusted = $false
             foreach ($conn in $connList) {
-              $cid = $conn.id
+              $cid     = $conn.id
               $enabled = @($conn.enabled_clients)
               $has     = ($enabled -contains $clientId)
               $should  = ($allowed -contains $cid)
 
               if ($should -and (-not $has)) {
-                # Add this client to allowed connections if missing
                 $new = @($enabled + $clientId | Sort-Object -Unique)
                 Invoke-RestMethod -Method Patch `
                   -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections/$cid" `
                   -Headers @{ Authorization = "Bearer $token" } `
                   -ContentType "application/json" `
                   -Body ( @{ enabled_clients = $new } | ConvertTo-Json )
+                $adjusted = $true
               }
               elseif ((-not $should) -and $has) {
-                # Remove from non-allowed connections
                 $new = @($enabled | Where-Object { $_ -ne $clientId })
                 Invoke-RestMethod -Method Patch `
                   -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/connections/$cid" `
                   -Headers @{ Authorization = "Bearer $token" } `
                   -ContentType "application/json" `
                   -Body ( @{ enabled_clients = $new } | ConvertTo-Json )
-                $bad = $true
+                $adjusted = $true
               }
             }
 
-            if ($bad) {
-              Write-Host "Adjusted connections for '$display' to only allowed set."
+            if ($adjusted) {
+              Write-Host "Adjusted connections for '$modKey' to only allowed set."
             } else {
-              Write-Host "Post-apply assertion passed for '$display' ✅"
+              Write-Host "Post-apply assertion passed for '$modKey' ✅"
             }
           }
 
@@ -212,8 +223,16 @@ jobs:
           foreach ($path in $paths) {
             $obj     = (Get-Content $path -Raw) | ConvertFrom-Yaml
             $display = [string]$obj.displayname
-            $clients = Invoke-RestMethod -Method Get -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100" `
-                        -Headers @{ Authorization = "Bearer $token" }
+            $clients = @()
+            $page = 0
+            while ($true) {
+              $resp = Invoke-RestMethod -Method Get `
+                -Uri "https://$($env:AUTH0_DOMAIN)/api/v2/clients?per_page=100&page=$page" `
+                -Headers @{ Authorization = "Bearer $token" }
+              if (-not $resp -or $resp.Count -eq 0) { break }
+              $clients += $resp
+              $page++
+            }
             $clientId = ($clients | Where-Object { $_.name -eq $display }).client_id
             if ($clientId) {
               Write-Host "Deleting client '$display' ($clientId) due to failure."

@@ -34,7 +34,7 @@ resource "auth0_client" "app" {
 }
 
 # Enable exactly the two static connections for this client.
-# This resource does NOT manage other clients on those connections.
+# These single-association resources do NOT own the full list of enabled clients.
 resource "auth0_connection_client" "primary" {
   connection_id = var.primary_connection_id
   client_id     = auth0_client.app.client_id

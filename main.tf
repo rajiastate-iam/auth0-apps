@@ -35,7 +35,7 @@ module "auth0_app" {
   org_name       = each.value.orgname
   servicenow_req = each.value.snow_req
 
-  # Static connection IDs for this tenant
+  # Static connection IDs (no enumeration)
   primary_connection_id   = local.primary_connection_id
   secondary_connection_id = local.secondary_connection_id
 }
